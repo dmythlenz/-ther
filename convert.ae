@@ -1,0 +1,78 @@
+// convert.ae — Generic Pixel Converter
+// Usage: node aether-host.js convert.ae <model-id> <hf-repo>
+
+print "🔍 AETHER Pixel Converter"
+print "Host: " + host_kind()
+print "CWD: " + kern_call("node_cwd")
+print ""
+
+let args = kern_call("node_argv")   // returns the script arguments
+let MODEL_ID = args[1] ?? "kimi-k3"
+let HF_REPO = args[2] ?? "moonshotai/Kimi-K3"
+
+let INDEX_URL = "https://huggingface.co/" + HF_REPO + "/resolve/main/model.safetensors.index.json"
+print "📥 Fetching index from: " + INDEX_URL
+
+let res = kern_call("node_fetch", INDEX_URL)
+if !res.ok {
+  print "❌ Fetch failed: " + str(res.error)
+  return
+}
+
+let index = from_json(res.text)
+let weightMap = index.weight_map
+let tensorNames = keys(weightMap)
+print "📦 Found " + str(len(tensorNames)) + " tensors"
+
+print "🔄 Building records..."
+mut records = []
+let progress = 0
+
+for tensor in tensorNames {
+  let file = weightMap[tensor]
+  let text = "SAFETENSORS|" + file + "|" + tensor
+  let dummy = px_ingest("tmp", tensor, text)
+  let hashHex = dummy.hash
+  records = push(records, { hash: hashHex, text: text, len: len(text) })
+
+  progress = progress + 1
+  if progress % 10000 == 0 {
+    print "  ... " + str(progress) + " / " + str(len(tensorNames))
+  }
+}
+
+print "✅ " + str(len(records)) + " records built"
+
+print "🔄 Sorting records by hash..."
+records = sortBy(records, fn(a, b) -> a.hash < b.hash)
+
+print "🔄 Building binary shards..."
+mut pix = ""
+mut idx = ""
+mut offset = 0
+
+for rec in records {
+  let hHex = rec.hash
+  let lenHex = str(rec.len).padStart(8, '0')
+  pix = pix + hHex + lenHex + rec.text
+
+  let offHex = str(offset).padStart(16, '0')
+  idx = idx + hHex + offHex
+
+  offset = offset + 12 + rec.len
+}
+
+let pixSize = (len(pix) / 1024 / 1024).toFixed(2)
+let idxSize = (len(idx) / 1024 / 1024).toFixed(2)
+let recCount = len(records)
+
+print "💾 Writing shard_" + MODEL_ID + ".pix (" + pixSize + " MB)..."
+kern_call("node_fs_write", "shard_" + MODEL_ID + ".pix", pix)
+
+print "💾 Writing shard_" + MODEL_ID + ".idx (" + idxSize + " MB)..."
+kern_call("node_fs_write", "shard_" + MODEL_ID + ".idx", idx)
+
+print ""
+print "✅ Conversion complete!"
+print "📄 shard_" + MODEL_ID + ".pix  -> " + pixSize + " MB (" + recCount + " records)"
+print "📄 shard_" + MODEL_ID + ".idx  -> " + idxSize + " MB"
