@@ -1,4 +1,4 @@
-// aether-host.js — Node.js host (safe extraction with regex)
+// aether-host.js — Node.js host (safe regex extraction, no DOM errors)
 const fs = require('fs');
 const path = require('path');
 
@@ -20,9 +20,7 @@ function extractCoreFromHTML() {
 
   const scriptContent = scriptMatch[1];
 
-  // Use regex to extract the AETHER_CORE object definition
-  // Find "const AETHER_CORE = {" and capture until the matching "};"
-  // We do a simple balanced brace search to handle nested objects.
+  // Find the AETHER_CORE object definition using balanced braces
   const coreStart = scriptContent.indexOf('const AETHER_CORE = {');
   if (coreStart === -1) {
     console.error('❌ Could not find "const AETHER_CORE = {" in script.');
@@ -55,7 +53,6 @@ function extractCoreFromHTML() {
 
   // Evaluate the extracted definition in a clean Node context
   try {
-    // Create a sandbox with basic globals
     const sandbox = {
       console: console,
       setTimeout: setTimeout,
@@ -101,7 +98,6 @@ function extractCoreFromHTML() {
     return core;
   } catch (e) {
     console.error('❌ Error evaluating extracted AETHER_CORE:', e.message);
-    console.error('   The extracted definition may be invalid.');
     process.exit(1);
   }
 }
@@ -127,7 +123,7 @@ function safeRegister(kernel, name, fn) {
 function bindNodeFS() {
   if (!AETHER_CORE.KERNEL) {
     console.warn('⚠️  AETHER_CORE.KERNEL missing, creating stub.');
-    AETHER_CORE.KERNEL = { register: () => {}, list: () => [], call: () => {} };
+    AETHER_CORE.KERNEL = { register: () => {}, list: () => {}, call: () => {} };
   }
 
   const bindings = {
