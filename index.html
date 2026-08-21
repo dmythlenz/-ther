@@ -446,7 +446,7 @@ class Interpreter{
     bind('includes',(a,v)=>Array.isArray(a)?a.includes(v):(typeof a==='string'?a.includes(String(v)):false));
     bind('upper',s=>String(s).toUpperCase());bind('lower',s=>String(s).toLowerCase());bind('trim',s=>String(s).trim());
     bind('replace',(s,a,b)=>String(s).split(String(a)).join(String(b)));
-    bind('starts_with',(s,p)=>String(s).startsWith(String(p)));bind('ends_with',(s,p)=>String(s).ends_with(String(p)));
+    bind('starts_with',(s,p)=>String(s).startsWith(String(p)));bind('ends_with',(s,p)=>String(s).endsWith(String(p)));
     bind('min',(...a)=>Math.min(...a.map(Number)));bind('max',(...a)=>Math.max(...a.map(Number)));
     bind('abs',Math.abs);bind('floor',Math.floor);bind('ceil',Math.ceil);bind('round',Math.round);bind('sqrt',Math.sqrt);
     bind('sin',Math.sin);bind('cos',Math.cos);bind('pow',Math.pow);bind('log',Math.log);bind('exp',Math.exp);
@@ -881,145 +881,170 @@ print(package_info())`,
 }else HOST.log('AETHER Core v1.0.0 ready host='+HOST.kind);
 
 // ═══════════════════════════════════════════════════════════════════════════
-// AUTO‑MOUNT FROM GITHUB CDN – CORRECTED & SAFE v2
+// AUTO‑MOUNT ALL MODELS FROM models.txt – DYNAMIC MULTI‑MODEL (BROWSER ONLY)
 // ═══════════════════════════════════════════════════════════════════════════
-(function autoMountKimi() {
-  // ─── EDIT THESE TWO LINES ──────────────────────────────
-  const GITHUB_USER = 'dmythlenz';
-  const GITHUB_REPO = '-ther';
-  // ────────────────────────────────────────────────────────
+if (HOST.isBrowser) {
+  (function autoMountAllModels() {
+    const GITHUB_USER = 'dmythlenz';
+    const GITHUB_REPO = '-ther';
+    const MODELS_TXT_URL =
+      `https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/main/models.txt`;
+    const RELEASE_BASE =
+      `https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/download/v1.0/`;
 
-  const GITHUB_BASE =
-    `https://github.com/${GITHUB_USER}/${GITHUB_REPO}/releases/download/v1.0/`;
-
-  const MODEL = 'kimi-k3';
-  const PIX_URL = GITHUB_BASE + `shard_${MODEL}.pix`;
-  const IDX_URL = GITHUB_BASE + `shard_${MODEL}.idx`;
-
-  // Defensive check: ensure core is loaded
-  if (typeof AETHER_CORE === 'undefined' || !AETHER_CORE.PX || !AETHER_CORE.FS) {
-    console.warn('AETHER_CORE not ready, retrying in 2s...');
-    setTimeout(autoMountKimi, 2000);
-    return;
-  }
-
-  const PX = AETHER_CORE.PX;
-  const FS = AETHER_CORE.FS;
-
-  // Safe base64 conversion for large binaries (chunked)
-  function uint8ToBase64(u8) {
-    const CHUNK_SIZE = 0x8000; // 32KB
-    let parts = [];
-    for (let i = 0; i < u8.length; i += CHUNK_SIZE) {
-      const slice = u8.subarray(i, Math.min(i + CHUNK_SIZE, u8.length));
-      parts.push(String.fromCharCode.apply(null, slice));
-    }
-    return btoa(parts.join(''));
-  }
-
-  async function mountFromGitHub() {
-    try {
-      // Direct fetch – no HEAD request (avoids CORS issues)
-      const idxRes = await fetch(IDX_URL);
-      if (!idxRes.ok) throw new Error('Index shard not found (HTTP ' + idxRes.status + ')');
-
-      const pixRes = await fetch(PIX_URL);
-      if (!pixRes.ok) throw new Error('Pixel shard not found (HTTP ' + pixRes.status + ')');
-
-      const [pixBytes, idxBytes] = await Promise.all([
-        pixRes.arrayBuffer().then(b => new Uint8Array(b)),
-        idxRes.arrayBuffer().then(b => new Uint8Array(b))
-      ]);
-
-      // Convert to base64 in chunks (no spread operator crash)
-      const pixB64 = uint8ToBase64(pixBytes);
-      const idxB64 = uint8ToBase64(idxBytes);
-
-      // Store in the in‑memory filesystem
-      FS.mkdir('/shards');
-      FS.write(`/shards/${MODEL}.pix`, pixB64, { encoding: 'base64' });
-      FS.write(`/shards/${MODEL}.idx`, idxB64, { encoding: 'base64' });
-
-      // Register in pixel store (for stats / search)
-      PX.ingest('shard', MODEL + '.pix', { size: pixBytes.length });
-      PX.ingest('shard', MODEL + '.idx', { size: idxBytes.length });
-
-      // Update UI
-      const status = document.getElementById('kimi-status');
-      if (status) {
-        status.textContent = '✅ mounted from cloud';
-        status.style.color = '#22d3a6';
-      }
-      const btn = document.getElementById('load-kimi-btn');
-      if (btn) {
-        btn.textContent = '🌌 Kimi K3 Ready';
-        btn.disabled = true;
-      }
-
-      const chatlog = document.getElementById('chatlog');
-      if (chatlog) {
-        const msg = document.createElement('div');
-        msg.className = 'msg bot';
-        msg.textContent = '✅ Kimi K3 mounted from GitHub cloud shard!\n' +
-          `📄 shard_${MODEL}.pix (${(pixBytes.length / 1024 / 1024).toFixed(2)} MB)\n` +
-          `📄 shard_${MODEL}.idx (${(idxBytes.length / 1024 / 1024).toFixed(2)} MB)`;
-        chatlog.appendChild(msg);
-        chatlog.scrollTop = chatlog.scrollHeight;
-      }
-
-      console.log('✅ Kimi K3 mounted from GitHub CDN');
-      return true;
-    } catch (e) {
-      console.warn('Cloud shard mount error:', e.message);
-      const status = document.getElementById('kimi-status');
-      if (status) {
-        status.textContent = '❌ ' + e.message.slice(0, 40);
-        status.style.color = '#f43f6e';
-      }
-      return false;
-    }
-  }
-
-  function addKimiButton() {
-    const toolbar = document.querySelector('.toolbar');
-    if (!toolbar || document.getElementById('load-kimi-btn')) return;
-
-    const btn = document.createElement('button');
-    btn.id = 'load-kimi-btn';
-    btn.textContent = '🌌 Auto Kimi K3';
-    btn.style.cssText = 'background:linear-gradient(135deg,#7c5cfc,#22d3ee);border:none;color:#fff;font-weight:700';
-    btn.onclick = mountFromGitHub;
-    toolbar.appendChild(btn);
-
-    const status = document.createElement('span');
-    status.id = 'kimi-status';
-    status.style.cssText = 'font-size:10px;color:var(--muted);margin-left:4px';
-    status.textContent = '⏳ checking...';
-    toolbar.appendChild(status);
-  }
-
-  setTimeout(async () => {
-    addKimiButton();
-
-    if (FS.exists('/shards/' + MODEL + '.pix')) {
-      const status = document.getElementById('kimi-status');
-      if (status) {
-        status.textContent = '✅ already mounted';
-        status.style.color = '#22d3a6';
-      }
-      const btn = document.getElementById('load-kimi-btn');
-      if (btn) {
-        btn.textContent = '🌌 Kimi K3 Ready';
-        btn.disabled = true;
-      }
+    if (typeof AETHER_CORE === 'undefined' || !AETHER_CORE.PX || !AETHER_CORE.FS) {
+      console.warn('AETHER_CORE not ready, retrying in 2s...');
+      setTimeout(autoMountAllModels, 2000);
       return;
     }
 
-    await mountFromGitHub();
-  }, 3000);
+    const PX = AETHER_CORE.PX;
+    const FS = AETHER_CORE.FS;
 
-  window.mountKimi = mountFromGitHub;
-})();
+    function uint8ToBase64(u8) {
+      const CHUNK_SIZE = 0x8000;
+      let parts = [];
+      for (let i = 0; i < u8.length; i += CHUNK_SIZE) {
+        const slice = u8.subarray(i, Math.min(i + CHUNK_SIZE, u8.length));
+        parts.push(String.fromCharCode.apply(null, slice));
+      }
+      return btoa(parts.join(''));
+    }
+
+    async function mountModelFromGitHub(modelId, repo) {
+      try {
+        const PIX_URL = RELEASE_BASE + `shard_${modelId}.pix`;
+        const IDX_URL = RELEASE_BASE + `shard_${modelId}.idx`;
+
+        const idxRes = await fetch(IDX_URL);
+        if (!idxRes.ok) {
+          console.log(`⏳ ${modelId}: shard not yet uploaded.`);
+          return false;
+        }
+
+        const pixRes = await fetch(PIX_URL);
+        if (!pixRes.ok) throw new Error('Pixel shard missing');
+
+        const [pixBytes, idxBytes] = await Promise.all([
+          pixRes.arrayBuffer().then(b => new Uint8Array(b)),
+          idxRes.arrayBuffer().then(b => new Uint8Array(b))
+        ]);
+
+        const pixB64 = uint8ToBase64(pixBytes);
+        const idxB64 = uint8ToBase64(idxBytes);
+
+        FS.mkdir('/shards');
+        FS.write(`/shards/${modelId}.pix`, pixB64, { encoding: 'base64' });
+        FS.write(`/shards/${modelId}.idx`, idxB64, { encoding: 'base64' });
+
+        PX.ingest('shard', modelId + '.pix', { size: pixBytes.length });
+        PX.ingest('shard', modelId + '.idx', { size: idxBytes.length });
+
+        console.log(`✅ ${modelId} mounted from GitHub CDN`);
+        return true;
+      } catch (e) {
+        console.warn(`❌ ${modelId} mount failed:`, e.message);
+        return false;
+      }
+    }
+
+    function addModelToUI(modelId) {
+      if (window.MODELS && MODELS.includes(modelId)) return;
+      if (window.MODELS) {
+        MODELS.push(modelId);
+        if (typeof renderModelMenu === 'function') renderModelMenu();
+      }
+      const status = document.getElementById('kimi-status');
+      if (status) {
+        const existing = status.textContent;
+        const mountedModels = existing.includes('✅') ? existing.split(' · ') : [];
+        const modelEntry = `${modelId} ✅`;
+        if (!mountedModels.includes(modelEntry)) {
+          mountedModels.push(modelEntry);
+          status.textContent = mountedModels.join(' · ');
+          status.style.color = '#22d3a6';
+        }
+      }
+    }
+
+    async function loadAllModels() {
+      try {
+        const res = await fetch(MODELS_TXT_URL);
+        if (!res.ok) throw new Error('Failed to fetch models.txt');
+        const text = await res.text();
+        const lines = text.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+
+        let mounted = 0;
+        for (const line of lines) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length < 2) continue;
+          const [modelId, repo] = parts;
+          const success = await mountModelFromGitHub(modelId, repo);
+          if (success) {
+            addModelToUI(modelId);
+            mounted++;
+          }
+        }
+
+        if (mounted > 0) {
+          console.log(`✅ ${mounted} model(s) mounted from GitHub CDN.`);
+          const btn = document.getElementById('load-kimi-btn');
+          if (btn) {
+            btn.textContent = `🌌 ${mounted} models ready`;
+            btn.disabled = true;
+          }
+        } else {
+          console.log('⏳ No shards found yet. Run the GitHub Action to build them.');
+        }
+      } catch (e) {
+        console.warn('❌ Error loading models.txt:', e.message);
+        await mountModelFromGitHub('kimi-k3', 'moonshotai/Kimi-K3')
+          .then(ok => { if (ok) addModelToUI('kimi-k3'); });
+      }
+    }
+
+    function addKimiButton() {
+      const toolbar = document.querySelector('.toolbar');
+      if (!toolbar || document.getElementById('load-kimi-btn')) return;
+
+      const btn = document.createElement('button');
+      btn.id = 'load-kimi-btn';
+      btn.textContent = '🌌 Load All Models';
+      btn.style.cssText = 'background:linear-gradient(135deg,#7c5cfc,#22d3ee);border:none;color:#fff;font-weight:700';
+      btn.onclick = loadAllModels;
+      toolbar.appendChild(btn);
+
+      const status = document.createElement('span');
+      status.id = 'kimi-status';
+      status.style.cssText = 'font-size:10px;color:var(--muted);margin-left:4px';
+      status.textContent = '⏳ checking...';
+      toolbar.appendChild(status);
+    }
+
+    setTimeout(async () => {
+      addKimiButton();
+      if (FS.exists('/shards/kimi-k3.pix') ||
+          FS.exists('/shards/dsv4-pro.pix') ||
+          FS.exists('/shards/glm-52.pix')) {
+        const status = document.getElementById('kimi-status');
+        if (status) {
+          status.textContent = '✅ models already mounted';
+          status.style.color = '#22d3a6';
+        }
+        const btn = document.getElementById('load-kimi-btn');
+        if (btn) {
+          btn.textContent = '🌌 Models Ready';
+          btn.disabled = true;
+        }
+        return;
+      }
+      await loadAllModels();
+    }, 3000);
+
+    window.loadAllModels = loadAllModels;
+    window.mountModel = mountModelFromGitHub;
+  })();
+}
 
 </script>
 </body>
