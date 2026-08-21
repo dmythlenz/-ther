@@ -1,114 +1,16 @@
-// aether-host.js — Node.js host (safe regex extraction, no DOM errors)
+// aether-host.js – now simply requires the extracted core
 const fs = require('fs');
 const path = require('path');
 
-function extractCoreFromHTML() {
-  const htmlPath = path.join(__dirname, 'index.html');
-  if (!fs.existsSync(htmlPath)) {
-    console.error('❌ index.html not found. Place this script in the same folder.');
-    process.exit(1);
-  }
-
-  const html = fs.readFileSync(htmlPath, 'utf8');
-
-  // Extract the main script block
-  const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
-  if (!scriptMatch) {
-    console.error('❌ No <script> tag found in index.html');
-    process.exit(1);
-  }
-
-  const scriptContent = scriptMatch[1];
-
-  // Find the AETHER_CORE object definition using balanced braces
-  const coreStart = scriptContent.indexOf('const AETHER_CORE = {');
-  if (coreStart === -1) {
-    console.error('❌ Could not find "const AETHER_CORE = {" in script.');
-    process.exit(1);
-  }
-
-  let braceCount = 0;
-  let endPos = coreStart;
-  const startObj = scriptContent.indexOf('{', coreStart);
-  if (startObj === -1) {
-    console.error('❌ Could not find opening brace for AETHER_CORE');
-    process.exit(1);
-  }
-
-  for (let i = startObj; i < scriptContent.length; i++) {
-    if (scriptContent[i] === '{') braceCount++;
-    if (scriptContent[i] === '}') braceCount--;
-    if (braceCount === 0) {
-      endPos = i + 1;
-      break;
-    }
-  }
-
-  if (braceCount !== 0) {
-    console.error('❌ Unbalanced braces while extracting AETHER_CORE');
-    process.exit(1);
-  }
-
-  const coreDefinition = scriptContent.substring(coreStart, endPos);
-
-  // Evaluate the extracted definition in a clean Node context
-  try {
-    const sandbox = {
-      console: console,
-      setTimeout: setTimeout,
-      clearTimeout: clearTimeout,
-      setInterval: setInterval,
-      clearInterval: clearInterval,
-      Buffer: Buffer,
-      process: process,
-      global: global,
-      // Mock browser objects that might be referenced inside the definition
-      window: {},
-      document: {
-        addEventListener: () => {},
-        getElementById: () => null,
-        createElement: () => ({ style: {}, appendChild: () => {} }),
-        querySelector: () => null,
-        querySelectorAll: () => [],
-        body: { appendChild: () => {} }
-      },
-      navigator: { userAgent: 'Node.js' },
-      HTMLElement: function() {},
-      localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
-      XMLHttpRequest: function() {},
-      // Expose the core variable so the eval can assign to it
-      AETHER_CORE: {}
-    };
-
-    // Run the extracted definition in the sandbox
-    const fn = new Function(
-      ...Object.keys(sandbox),
-      `"use strict"; ${coreDefinition}; return AETHER_CORE;`
-    );
-    const core = fn(...Object.values(sandbox));
-
-    if (!core || typeof core !== 'object') {
-      console.error('❌ Extraction returned invalid object');
-      process.exit(1);
-    }
-
-    console.log('✅ AETHER_CORE extracted from index.html');
-    console.log(`   Version: ${core.version || 'unknown'}`);
-    console.log(`   Host: ${core.host || 'unknown'}`);
-    return core;
-  } catch (e) {
-    console.error('❌ Error evaluating extracted AETHER_CORE:', e.message);
-    process.exit(1);
-  }
-}
-
-// ─── Load Core ───────────────────────────────────────────────────
+// Load the core directly – no parsing needed
 let AETHER_CORE;
 try {
   AETHER_CORE = require('./aether-core.js');
   console.log('✅ AETHER_CORE loaded from aether-core.js');
 } catch (e) {
-  AETHER_CORE = extractCoreFromHTML();
+  console.error('❌ Failed to load aether-core.js:', e.message);
+  console.error('   Please ensure aether-core.js exists in the same folder.');
+  process.exit(1);
 }
 
 // ─── Bind Node.js capabilities ──────────────────────────────────
