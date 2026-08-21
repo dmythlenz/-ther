@@ -17,22 +17,35 @@
   const PX = AETHER_CORE.PX;
   const FS = AETHER_CORE.FS;
 
+  // Safe conversion of Uint8Array to base64 in chunks to avoid argument-limit / OOM
+  function uint8ToBase64(u8) {
+    const CHUNK_SIZE = 0x8000; // 32KB
+    let index = 0;
+    let parts = [];
+    while (index < u8.length) {
+      const slice = u8.subarray(index, Math.min(index + CHUNK_SIZE, u8.length));
+      parts.push(String.fromCharCode.apply(null, slice));
+      index += CHUNK_SIZE;
+    }
+    return btoa(parts.join(''));
+  }
+
   async function mountFromGitHub() {
     try {
-      const head = await fetch(IDX_URL, { method: 'HEAD' });
-      if (!head.ok) throw new Error('Shard not in release yet.');
+      // Try fetching the index file directly. HEAD can be blocked by CORS so we avoid it.
+      const idxRes = await fetch(IDX_URL);
+      if (!idxRes.ok) throw new Error('Shard not in release yet or network/CORS issue.');
 
-      const [pixRes, idxRes] = await Promise.all([
-        fetch(PIX_URL),
-        fetch(IDX_URL)
+      const [pixRes] = await Promise.all([
+        fetch(PIX_URL)
       ]);
-      if (!pixRes.ok || !idxRes.ok) throw new Error('Download failed');
+      if (!pixRes.ok) throw new Error('Download failed for pix shard');
 
       const pixBytes = new Uint8Array(await pixRes.arrayBuffer());
       const idxBytes = new Uint8Array(await idxRes.arrayBuffer());
 
-      const pixB64 = btoa(String.fromCharCode(...pixBytes));
-      const idxB64 = btoa(String.fromCharCode(...idxBytes));
+      const pixB64 = uint8ToBase64(pixBytes);
+      const idxB64 = uint8ToBase64(idxBytes);
 
       FS.mkdir('/shards');
       FS.write(`/shards/${MODEL}.pix`, pixB64, { encoding: 'base64' });
@@ -66,7 +79,7 @@
 
       return true;
     } catch (e) {
-      console.warn('Cloud shard miss:', e.message);
+      console.warn('Cloud shard miss:', e && e.message ? e.message : String(e));
       return false;
     }
   }
