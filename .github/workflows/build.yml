@@ -1,0 +1,51 @@
+name: Pixel Builder (AETHER) – Auto on Push
+
+on:
+  push:
+    paths:
+      - 'models.txt'
+  workflow_dispatch:   # manual trigger still available
+    inputs:
+      model:
+        description: 'Model ID (e.g. kimi-k3)'
+        required: true
+        default: 'kimi-k3'
+      repo:
+        description: 'HF repo (e.g. moonshotai/Kimi-K3)'
+        required: true
+        default: 'moonshotai/Kimi-K3'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Read models.txt and convert each
+        id: models
+        run: |
+          if [ -f models.txt ]; then
+            cat models.txt | while read line; do
+              if [ -z "$line" ]; then continue; fi
+              MODEL=$(echo $line | cut -d' ' -f1)
+              REPO=$(echo $line | cut -d' ' -f2)
+              echo "Converting $MODEL from $REPO"
+              node aether-host.js convert.ae $MODEL $REPO
+              # We'll upload all shards at the end
+            done
+          fi
+
+      - name: Upload all generated shards to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0"
+          files: |
+            shard_*.pix
+            shard_*.idx
+          fail_on_unmatched_files: false   # allow if no shards yet
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
