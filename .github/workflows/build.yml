@@ -42,7 +42,7 @@ jobs:
             local exitcode=$?
             if [ $exitcode -eq 0 ]; then
               echo "✅ Success: $model"
-              # Move files to shards/ if they're in root
+              # Move files if they are in root (just in case)
               if [ -f "shard_${model}.pix" ]; then
                 mv "shard_${model}.pix" "shards/"
               fi
@@ -55,6 +55,7 @@ jobs:
             fi
           }
 
+          # Manual trigger: if model input is provided, convert that one only
           if [ -n "${{ github.event.inputs.model }}" ]; then
             MODEL="${{ github.event.inputs.model }}"
             REPO="${{ github.event.inputs.repo }}"
@@ -63,6 +64,7 @@ jobs:
             exit $?
           fi
 
+          # Otherwise read models.txt
           if [ -f models.txt ]; then
             echo "📋 Reading models from models.txt"
             while IFS=' ' read -r model repo || [ -n "$model" ]; do
@@ -71,7 +73,7 @@ jobs:
               convert_model "$model" "$repo" || true
             done < models.txt
           else
-            echo "⚠️  No models.txt found"
+            echo "⚠️  No models.txt found – nothing to do."
             exit 0
           fi
 
