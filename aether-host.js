@@ -1,72 +1,68 @@
-// aether-host.js – now simply requires the extracted core
+// aether-host.js – Node.js host with full error handling
 const fs = require('fs');
 const path = require('path');
 
-// Load the core directly – no parsing needed
 let AETHER_CORE;
 try {
   AETHER_CORE = require('./aether-core.js');
-  console.log('✅ AETHER_CORE loaded from aether-core.js');
+  console.log('✅ AETHER_CORE loaded.');
 } catch (e) {
   console.error('❌ Failed to load aether-core.js:', e.message);
   console.error('   Please ensure aether-core.js exists in the same folder.');
   process.exit(1);
 }
 
-// ─── Bind Node.js capabilities ──────────────────────────────────
-function safeRegister(kernel, name, fn) {
-  if (kernel && typeof kernel.register === 'function') {
-    kernel.register(name, fn);
-  } else {
-    console.warn(`⚠️  KERNEL not ready, skipping registration for ${name}`);
+// Ensure KERNEL exists
+if (!AETHER_CORE.KERNEL) {
+  console.warn('⚠️  KERNEL missing, creating stub.');
+  AETHER_CORE.KERNEL = { register: () => {}, call: () => {} };
+}
+
+// ─── Register Node.js bindings ──────────────────────────────────
+function safeRegister(name, fn) {
+  try {
+    AETHER_CORE.KERNEL.register(name, fn);
+  } catch (e) {
+    console.warn(`⚠️  Failed to register ${name}:`, e.message);
   }
 }
 
-function bindNodeFS() {
-  if (!AETHER_CORE.KERNEL) {
-    console.warn('⚠️  AETHER_CORE.KERNEL missing, creating stub.');
-    AETHER_CORE.KERNEL = { register: () => {}, list: () => {}, call: () => {} };
-  }
+const bindings = {
+  node_fs_read: (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } },
+  node_fs_write: (p, c) => { try { fs.writeFileSync(p, c); return true; } catch (e) { return false; } },
+  node_fs_exists: (p) => fs.existsSync(p),
+  node_fs_stat: (p) => { try { const s = fs.statSync(p); return { size: s.size, mtime: s.mtimeMs }; } catch (e) { return null; } },
+  node_fs_list: (p) => { try { return fs.readdirSync(p || '.'); } catch (e) { return []; } },
+  node_fs_mkdir: (p) => { try { fs.mkdirSync(p, { recursive: true }); return true; } catch (e) { return false; } },
+  node_fetch: async (url) => {
+    try {
+      const f = global.fetch || (await import('node-fetch')).default;
+      if (!f) throw new Error('No fetch implementation');
+      const res = await f(url);
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text };
+    } catch (e) { return { ok: false, error: e.message }; }
+  },
+  node_fetch_binary: async (url) => {
+    try {
+      const f = global.fetch || (await import('node-fetch')).default;
+      if (!f) throw new Error('No fetch implementation');
+      const res = await f(url);
+      const buffer = await res.arrayBuffer();
+      return { ok: res.ok, status: res.status, bytes: Buffer.from(buffer) };
+    } catch (e) { return { ok: false, error: e.message }; }
+  },
+  node_cwd: () => process.cwd(),
+  node_argv: () => process.argv.slice(2),
+  node_env: (k) => process.env[k] || null,
+  node_exit: (code) => process.exit(code || 0),
+  node_sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+};
 
-  const bindings = {
-    node_fs_read: (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; } },
-    node_fs_write: (p, c) => { try { fs.writeFileSync(p, c); return true; } catch (e) { return false; } },
-    node_fs_exists: (p) => fs.existsSync(p),
-    node_fs_stat: (p) => { try { const s = fs.statSync(p); return { size: s.size, mtime: s.mtimeMs }; } catch (e) { return null; } },
-    node_fs_list: (p) => { try { return fs.readdirSync(p || '.'); } catch (e) { return []; } },
-    node_fs_mkdir: (p) => { try { fs.mkdirSync(p, { recursive: true }); return true; } catch (e) { return false; } },
-    node_fetch: async (url) => {
-      try {
-        const f = global.fetch || (await import('node-fetch')).default;
-        if (!f) throw new Error('No fetch implementation');
-        const res = await f(url);
-        const text = await res.text();
-        return { ok: res.ok, status: res.status, text };
-      } catch (e) { return { ok: false, error: e.message }; }
-    },
-    node_fetch_binary: async (url) => {
-      try {
-        const f = global.fetch || (await import('node-fetch')).default;
-        if (!f) throw new Error('No fetch implementation');
-        const res = await f(url);
-        const buffer = await res.arrayBuffer();
-        return { ok: res.ok, status: res.status, bytes: Buffer.from(buffer) };
-      } catch (e) { return { ok: false, error: e.message }; }
-    },
-    node_cwd: () => process.cwd(),
-    node_argv: () => process.argv.slice(2),
-    node_env: (k) => process.env[k] || null,
-    node_exit: (code) => process.exit(code || 0),
-    node_sleep: (ms) => new Promise(r => setTimeout(r, ms)),
-  };
-
-  for (const [name, fn] of Object.entries(bindings)) {
-    safeRegister(AETHER_CORE.KERNEL, name, fn);
-  }
-  console.log('✅ Node.js bindings registered');
+for (const [name, fn] of Object.entries(bindings)) {
+  safeRegister(name, fn);
 }
-
-bindNodeFS();
+console.log('✅ Node.js bindings registered.');
 
 // ─── Run Script or REPL ─────────────────────────────────────────
 function runScript(filePath) {
@@ -75,12 +71,10 @@ function runScript(filePath) {
     process.exit(1);
   }
   const code = fs.readFileSync(filePath, 'utf8');
-
   if (typeof AETHER_CORE.run !== 'function') {
-    console.error('❌ AETHER_CORE.run is not a function. Check core extraction.');
+    console.error('❌ AETHER_CORE.run is not a function.');
     process.exit(1);
   }
-
   const result = AETHER_CORE.run(code);
   if (result.ok) {
     for (const line of result.output) console.log(line);
