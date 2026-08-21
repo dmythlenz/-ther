@@ -1,32 +1,87 @@
-// convert.ae — Generic Pixel Converter
+// convert.ae — Universal Pixel Converter with retry logic
 // Usage: node aether-host.js convert.ae <model-id> <hf-repo>
 
-print "🔍 AETHER Pixel Converter"
+print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+print "  AETHER Pixel Converter v2.0"
+print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 print "Host: " + host_kind()
 print "CWD: " + kern_call("node_cwd")
 print ""
 
-let args = kern_call("node_argv")   // returns the script arguments
-let MODEL_ID = args[1] ?? "kimi-k3"
-let HF_REPO = args[2] ?? "moonshotai/Kimi-K3"
+// ─── Parse arguments ──────────────────────────────────────────
+let args = kern_call("node_argv")
+let MODEL_ID = args[1] ?? ""
+let HF_REPO = args[2] ?? ""
 
+if MODEL_ID == "" {
+  print "❌ Error: MODEL_ID is required"
+  print "Usage: node aether-host.js convert.ae <model-id> [hf-repo]"
+  print "Example: node aether-host.js convert.ae kimi-k3 moonshotai/Kimi-K3"
+  kern_call("node_exit", 1)
+}
+
+if HF_REPO == "" {
+  HF_REPO = MODEL_ID
+}
+
+print "📦 Model: " + MODEL_ID
+print "📚 Repo:  " + HF_REPO
+print ""
+
+// ─── Fetch with retry ────────────────────────────────────────
+fn fetch_with_retry(url, maxRetries=3) {
+  mut attempt = 0
+  mut lastError = ""
+  while attempt < maxRetries {
+    attempt = attempt + 1
+    print "  Fetch attempt " + str(attempt) + "/" + str(maxRetries) + "..."
+    let res = kern_call("node_fetch", url)
+    if res.ok {
+      print "  ✅ Fetch succeeded"
+      return res
+    }
+    lastError = res.error ?? "Unknown error"
+    print "  ⚠️ Attempt " + str(attempt) + " failed: " + lastError
+    if attempt < maxRetries {
+      kern_call("node_sleep", 2000)  // wait 2s
+    }
+  }
+  print "❌ All fetch attempts failed: " + lastError
+  return { ok: false, error: lastError }
+}
+
+// ─── Download index ──────────────────────────────────────────
 let INDEX_URL = "https://huggingface.co/" + HF_REPO + "/resolve/main/model.safetensors.index.json"
-print "📥 Fetching index from: " + INDEX_URL
+print "🔍 Fetching index: " + INDEX_URL
 
-let res = kern_call("node_fetch", INDEX_URL)
+let res = fetch_with_retry(INDEX_URL)
 if !res.ok {
-  print "❌ Fetch failed: " + str(res.error)
-  return
+  print "❌ Failed to fetch index: " + str(res.error)
+  kern_call("node_exit", 1)
 }
 
 let index = from_json(res.text)
-let weightMap = index.weight_map
-let tensorNames = keys(weightMap)
-print "📦 Found " + str(len(tensorNames)) + " tensors"
+if index == null {
+  print "❌ Failed to parse JSON"
+  kern_call("node_exit", 1)
+}
 
-print "🔄 Building records..."
+let weightMap = index.weight_map
+if weightMap == null {
+  print "❌ Invalid index: missing 'weight_map'"
+  kern_call("node_exit", 1)
+}
+
+let tensorNames = keys(weightMap)
+let totalTensors = len(tensorNames)
+print "✅ Found " + str(totalTensors) + " tensors"
+print ""
+
+// ─── Build records ────────────────────────────────────────────
+print "📝 Building records..."
 mut records = []
-let progress = 0
+mut progress = 0
+mut lastReport = 0
 
 for tensor in tensorNames {
   let file = weightMap[tensor]
@@ -36,17 +91,23 @@ for tensor in tensorNames {
   records = push(records, { hash: hashHex, text: text, len: len(text) })
 
   progress = progress + 1
-  if progress % 10000 == 0 {
-    print "  ... " + str(progress) + " / " + str(len(tensorNames))
+  if progress - lastReport >= 10000 {
+    print "  ... " + str(progress) + " / " + str(totalTensors) + " tensors processed"
+    lastReport = progress
   }
 }
 
 print "✅ " + str(len(records)) + " records built"
+print ""
 
-print "🔄 Sorting records by hash..."
+// ─── Sort by hash ─────────────────────────────────────────────
+print "📊 Sorting records by hash..."
 records = sortBy(records, fn(a, b) -> a.hash < b.hash)
+print "✅ Sorting complete"
+print ""
 
-print "🔄 Building binary shards..."
+// ─── Build binary shards ──────────────────────────────────────
+print "📦 Building binary shards..."
 mut pix = ""
 mut idx = ""
 mut offset = 0
@@ -66,13 +127,31 @@ let pixSize = (len(pix) / 1024 / 1024).toFixed(2)
 let idxSize = (len(idx) / 1024 / 1024).toFixed(2)
 let recCount = len(records)
 
-print "💾 Writing shard_" + MODEL_ID + ".pix (" + pixSize + " MB)..."
-kern_call("node_fs_write", "shard_" + MODEL_ID + ".pix", pix)
+// ─── Create output directory ──────────────────────────────────
+let shardDir = "shards"
+if !kern_call("node_fs_exists", shardDir) {
+  kern_call("node_fs_mkdir", shardDir)
+}
+let pixPath = shardDir + "/shard_" + MODEL_ID + ".pix"
+let idxPath = shardDir + "/shard_" + MODEL_ID + ".idx"
 
-print "💾 Writing shard_" + MODEL_ID + ".idx (" + idxSize + " MB)..."
-kern_call("node_fs_write", "shard_" + MODEL_ID + ".idx", idx)
+print "💾 Writing " + pixPath + " (" + pixSize + " MB)..."
+let writeOk = kern_call("node_fs_write", pixPath, pix)
+if !writeOk {
+  print "❌ Failed to write .pix file"
+  kern_call("node_exit", 1)
+}
+
+print "💾 Writing " + idxPath + " (" + idxSize + " MB)..."
+writeOk = kern_call("node_fs_write", idxPath, idx)
+if !writeOk {
+  print "❌ Failed to write .idx file"
+  kern_call("node_exit", 1)
+}
 
 print ""
+print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 print "✅ Conversion complete!"
-print "📄 shard_" + MODEL_ID + ".pix  -> " + pixSize + " MB (" + recCount + " records)"
-print "📄 shard_" + MODEL_ID + ".idx  -> " + idxSize + " MB"
+print "  📄 " + pixPath + "  -> " + pixSize + " MB (" + recCount + " records)"
+print "  📄 " + idxPath + "  -> " + idxSize + " MB"
+print "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
