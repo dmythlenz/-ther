@@ -1,0 +1,1635 @@
+// ================================================================
+// AETHER Core v1.0.0 — Foundation (full runtime)
+// Standalone · Zero dependencies · Browser + Node.js
+// ================================================================
+
+'use strict';
+
+const HOST = (() => {
+  const g = typeof globalThis !== 'undefined' ? globalThis : {};
+  const isBrowser = typeof document !== 'undefined' && typeof window !== 'undefined';
+  const isNode = typeof process !== 'undefined' && process.versions && process.versions.node;
+  const storage = (() => {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        return {
+          get: k => { try { return localStorage.getItem(k); } catch (e) { return null; } },
+          set: (k, v) => { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
+        };
+      }
+    } catch (e) {}
+    const mem = new Map();
+    return {
+      get: k => mem.has(k) ? mem.get(k) : null,
+      set: (k, v) => { mem.set(k, String(v)); return true; }
+    };
+  })();
+  return {
+    kind: isBrowser ? 'browser' : (isNode ? 'node' : 'pure-js'),
+    isBrowser,
+    isNode,
+    storage,
+    global: g,
+    now: () => Date.now(),
+    boot: Date.now(),
+    log: (...a) => { try { console.log(...a); } catch (e) {} },
+    hasMedia: isBrowser && !!(navigator && navigator.mediaDevices),
+    hasWebGL: isBrowser && (() => {
+      try { const c = document.createElement('canvas'); return !!(c.getContext('webgl') || c.getContext('experimental-webgl')); } catch (e) { return false; }
+    })(),
+    hasAudio: isBrowser && typeof AudioContext !== 'undefined'
+  };
+})();
+
+// ─── Language core (Omega surface) ─────────────────────────────────────────
+const TT = {
+  EOF: 'EOF', IDENT: 'IDENT', NUM: 'NUM', STR: 'STR',
+  LET: 'let', MUT: 'mut', CONST: 'const', FN: 'fn', RETURN: 'return',
+  IF: 'if', ELSE: 'else', WHILE: 'while', FOR: 'for', IN: 'in',
+  BREAK: 'break', CONTINUE: 'continue', MATCH: 'match', STRUCT: 'struct',
+  CLASS: 'class', IMPORT: 'import', NEW: 'new', TRY: 'try', CATCH: 'catch',
+  TRUE: 'true', FALSE: 'false', NIL: 'nil',
+  PLUS: '+', MINUS: '-', STAR: '*', SLASH: '/', PCT: '%', POW: '**',
+  EQ: '=', EQEQ: '==', NEQ: '!=', LT: '<', GT: '>', LTE: '<=', GTE: '>=',
+  AND: '&&', OR: '||', NOT: '!', ARROW: '->', FAT: '=>',
+  LP: '(', RP: ')', LB: '[', RB: ']', LC: '{', RC: '}',
+  COMMA: ',', DOT: '.', COLON: ':', SEMI: ';', Q: '?',
+  PIPE: '|>', HASHLC: '#{', SPREAD: '...'
+};
+const KW = {
+  let: TT.LET, mut: TT.MUT, const: TT.CONST, fn: TT.FN, return: TT.RETURN,
+  if: TT.IF, else: TT.ELSE, while: TT.WHILE, for: TT.FOR, in: TT.IN,
+  break: TT.BREAK, continue: TT.CONTINUE, match: TT.MATCH,
+  struct: TT.STRUCT, class: TT.CLASS, import: TT.IMPORT, new: TT.NEW,
+  try: TT.TRY, catch: TT.CATCH, true: TT.TRUE, false: TT.FALSE, nil: TT.NIL
+};
+
+class Lexer {
+  constructor(src) { this.src = String(src); this.i = 0; this.line = 1; this.col = 1; this.n = this.src.length; }
+  peek(o) { return this.src[this.i + (o || 0)]; }
+  adv() { const c = this.src[this.i++]; if (c === '\n') { this.line++; this.col = 1; } else this.col++; return c; }
+  skip() {
+    for (;;) {
+      const c = this.peek();
+      if (c === ' ' || c === '\t' || c === '\r' || c === '\n') { this.adv(); continue; }
+      if (c === '#' && this.peek(1) !== '{') { while (this.peek() && this.peek() !== '\n') this.adv(); continue; }
+      if (c === '/' && this.peek(1) === '/') { while (this.peek() && this.peek() !== '\n') this.adv(); continue; }
+      if (c === '/' && this.peek(1) === '*') { this.adv(); this.adv(); while (this.peek() && !(this.peek() === '*' && this.peek(1) === '/')) this.adv(); if (this.peek()) { this.adv(); this.adv(); } continue; }
+      break;
+    }
+  }
+  tok(type, value, raw) { return { type, value, raw: raw != null ? raw : String(value), line: this.line, col: this.col }; }
+  number() {
+    let s = '';
+    while (this.peek() && /[0-9._]/.test(this.peek())) { if (this.peek() === '_') { this.adv(); continue; } s += this.adv(); }
+    return this.tok(TT.NUM, parseFloat(s), s);
+  }
+  string() {
+    const q = this.adv();
+    let s = '';
+    while (this.peek() && this.peek() !== q) {
+      if (this.peek() === '\\') { this.adv(); const e = this.adv(); s += ({ n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', "'": "'" }[e] || e); }
+      else s += this.adv();
+    }
+    if (this.peek() === q) this.adv();
+    return this.tok(TT.STR, s);
+  }
+  ident() {
+    let s = '';
+    while (this.peek() && /[a-zA-Z0-9_$]/.test(this.peek())) s += this.adv();
+    if (KW[s] !== undefined) return this.tok(KW[s], s);
+    return this.tok(TT.IDENT, s);
+  }
+  tokenize() {
+    const out = [];
+    for (;;) {
+      this.skip();
+      const c = this.peek();
+      if (c === undefined || this.i >= this.n) { out.push(this.tok(TT.EOF, null)); break; }
+      if (/[0-9]/.test(c)) { out.push(this.number()); continue; }
+      if (c === '"' || c === "'") { out.push(this.string()); continue; }
+      if (/[a-zA-Z_$]/.test(c)) { out.push(this.ident()); continue; }
+      if (c === '#' && this.peek(1) === '{') { this.adv(); this.adv(); out.push(this.tok(TT.HASHLC, '#{')); continue; }
+      if (c === '.' && this.peek(1) === '.' && this.peek(2) === '.') { this.adv(); this.adv(); this.adv(); out.push(this.tok(TT.SPREAD, '...')); continue; }
+      const two = c + (this.peek(1) || '');
+      const ops2 = { '==': TT.EQEQ, '!=': TT.NEQ, '<=': TT.LTE, '>=': TT.GTE, '&&': TT.AND, '||': TT.OR, '->': TT.ARROW, '=>': TT.FAT, '**': TT.POW, '|>': TT.PIPE };
+      if (ops2[two]) { this.adv(); this.adv(); out.push(this.tok(ops2[two], two)); continue; }
+      const one = { '+': TT.PLUS, '-': TT.MINUS, '*': TT.STAR, '/': TT.SLASH, '%': TT.PCT, '=': TT.EQ, '<': TT.LT, '>': TT.GT, '!': TT.NOT, '(': TT.LP, ')': TT.RP, '[': TT.LB, ']': TT.RB, '{': TT.LC, '}': TT.RC, ',': TT.COMMA, '.': TT.DOT, ':': TT.COLON, ';': TT.SEMI, '?': TT.Q };
+      if (one[c]) { this.adv(); out.push(this.tok(one[c], c)); continue; }
+      throw new Error("Unexpected '" + c + "' at line " + this.line);
+    }
+    return out;
+  }
+}
+
+class Parser {
+  constructor(tokens) { this.t = tokens; this.i = 0; }
+  cur() { return this.t[this.i] || { type: TT.EOF }; }
+  adv() { return this.t[this.i++]; }
+  match(...types) { if (types.includes(this.cur().type)) { this.adv(); return true; } return false; }
+  expect(type, msg) { if (this.cur().type === type) return this.adv(); throw new Error((msg || 'Expected ' + type) + ' at line ' + (this.cur().line || '?')); }
+  parse() { const body = []; while (this.cur().type !== TT.EOF) body.push(this.statement()); return { type: 'Program', body }; }
+  statement() {
+    const c = this.cur();
+    if (c.type === TT.LET || c.type === TT.MUT || c.type === TT.CONST) return this.letStmt();
+    if (c.type === TT.FN) return this.fnStmt();
+    if (c.type === TT.IF) return this.ifStmt();
+    if (c.type === TT.WHILE) return this.whileStmt();
+    if (c.type === TT.FOR) return this.forStmt();
+    if (c.type === TT.RETURN) { this.adv(); const e = (this.cur().type === TT.RC || this.cur().type === TT.EOF || this.cur().type === TT.SEMI) ? null : this.expression(); this.match(TT.SEMI); return { type: 'Return', expr: e }; }
+    if (c.type === TT.BREAK) { this.adv(); this.match(TT.SEMI); return { type: 'Break' }; }
+    if (c.type === TT.CONTINUE) { this.adv(); this.match(TT.SEMI); return { type: 'Continue' }; }
+    if (c.type === TT.MATCH) return this.matchStmt();
+    if (c.type === TT.STRUCT) return this.structStmt();
+    if (c.type === TT.CLASS) return this.classStmt();
+    if (c.type === TT.IMPORT) return this.importStmt();
+    if (c.type === TT.TRY) return this.tryStmt();
+    if (c.type === TT.LC) return this.block();
+    const e = this.expression();
+    this.match(TT.SEMI);
+    return { type: 'ExprStmt', expr: e };
+  }
+  block() { this.expect(TT.LC); const stmts = []; while (this.cur().type !== TT.RC && this.cur().type !== TT.EOF) stmts.push(this.statement()); this.expect(TT.RC); return { type: 'Block', stmts }; }
+  letStmt() {
+    const isConst = this.cur().type === TT.CONST;
+    this.adv();
+    const name = this.expect(TT.IDENT).value;
+    let value = null;
+    if (this.match(TT.EQ)) value = this.expression();
+    this.match(TT.SEMI);
+    return { type: 'Let', name, value, mutable: !isConst, isConst };
+  }
+  fnStmt() {
+    this.expect(TT.FN);
+    const name = this.cur().type === TT.IDENT ? this.adv().value : null;
+    this.expect(TT.LP);
+    const params = [];
+    let rest = null;
+    if (this.cur().type !== TT.RP) {
+      do {
+        if (this.match(TT.SPREAD)) { rest = this.expect(TT.IDENT).value; break; }
+        params.push(this.expect(TT.IDENT).value);
+      } while (this.match(TT.COMMA));
+    }
+    this.expect(TT.RP);
+    let body;
+    if (this.match(TT.ARROW) || this.match(TT.FAT)) body = { type: 'Return', expr: this.expression() };
+    else body = this.block();
+    return { type: 'Fn', name, params, rest, body };
+  }
+  ifStmt() {
+    this.expect(TT.IF);
+    const cond = this.expression();
+    const then = this.cur().type === TT.LC ? this.block() : this.statement();
+    let els = null;
+    if (this.match(TT.ELSE)) els = this.cur().type === TT.IF ? this.ifStmt() : (this.cur().type === TT.LC ? this.block() : this.statement());
+    return { type: 'If', cond, then, else: els };
+  }
+  whileStmt() {
+    this.expect(TT.WHILE);
+    const cond = this.expression();
+    const body = this.cur().type === TT.LC ? this.block() : this.statement();
+    return { type: 'While', cond, body };
+  }
+  forStmt() {
+    this.expect(TT.FOR);
+    const name = this.expect(TT.IDENT).value;
+    this.expect(TT.IN);
+    const iter = this.expression();
+    const body = this.cur().type === TT.LC ? this.block() : this.statement();
+    return { type: 'For', name, iter, body };
+  }
+  matchStmt() {
+    this.expect(TT.MATCH);
+    const target = this.expression();
+    this.expect(TT.LC);
+    const arms = [];
+    while (this.cur().type !== TT.RC && this.cur().type !== TT.EOF) {
+      let pat;
+      if (this.cur().type === TT.IDENT && this.cur().value === '_') { this.adv(); pat = { type: 'Wildcard' }; }
+      else pat = this.expression();
+      this.expect(TT.FAT);
+      const body = this.cur().type === TT.LC ? this.block() : this.statement();
+      arms.push({ pat, body });
+    }
+    this.expect(TT.RC);
+    return { type: 'Match', target, arms };
+  }
+  structStmt() {
+    this.expect(TT.STRUCT);
+    const name = this.expect(TT.IDENT).value;
+    this.expect(TT.LC);
+    const fields = [];
+    while (this.cur().type !== TT.RC && this.cur().type !== TT.EOF) {
+      fields.push(this.expect(TT.IDENT).value);
+      if (this.match(TT.COLON)) this.adv();
+      this.match(TT.COMMA);
+    }
+    this.expect(TT.RC);
+    return { type: 'Struct', name, fields };
+  }
+  classStmt() {
+    this.expect(TT.CLASS);
+    const name = this.expect(TT.IDENT).value;
+    this.expect(TT.LC);
+    const methods = [];
+    while (this.cur().type !== TT.RC && this.cur().type !== TT.EOF) {
+      if (this.cur().type === TT.FN || this.cur().type === TT.IDENT) {
+        if (this.cur().type === TT.IDENT && this.cur().value !== 'fn') {
+          const mname = this.adv().value;
+          this.expect(TT.LP);
+          const params = [];
+          if (this.cur().type !== TT.RP) {
+            do { params.push(this.expect(TT.IDENT).value); } while (this.match(TT.COMMA));
+          }
+          this.expect(TT.RP);
+          let body;
+          if (this.match(TT.ARROW) || this.match(TT.FAT)) body = { type: 'Return', expr: this.expression() };
+          else body = this.block();
+          methods.push({ type: 'Fn', name: mname, params, body });
+        } else methods.push(this.fnStmt());
+      } else this.adv();
+    }
+    this.expect(TT.RC);
+    return { type: 'Class', name, methods };
+  }
+  importStmt() {
+    this.expect(TT.IMPORT);
+    const path = this.cur().type === TT.STR ? this.adv().value : this.expect(TT.IDENT).value;
+    this.match(TT.SEMI);
+    return { type: 'Import', path };
+  }
+  tryStmt() {
+    this.expect(TT.TRY);
+    const tryBody = this.block();
+    this.expect(TT.CATCH);
+    let catchVar = 'e';
+    if (this.cur().type === TT.IDENT) catchVar = this.adv().value;
+    const catchBody = this.block();
+    return { type: 'Try', tryBody, catchVar, catchBody };
+  }
+  expression() { return this.ternary(); }
+  ternary() {
+    let e = this.or();
+    if (this.match(TT.Q)) {
+      const t = this.expression();
+      this.expect(TT.COLON);
+      const f = this.expression();
+      return { type: 'Ternary', cond: e, then: t, else: f };
+    }
+    return e;
+  }
+  or() {
+    let e = this.and();
+    while (this.match(TT.OR)) { const r = this.and(); e = { type: 'Binary', op: '||', left: e, right: r }; }
+    return e;
+  }
+  and() {
+    let e = this.equality();
+    while (this.match(TT.AND)) { const r = this.equality(); e = { type: 'Binary', op: '&&', left: e, right: r }; }
+    return e;
+  }
+  equality() {
+    let e = this.comparison();
+    while (this.cur().type === TT.EQEQ || this.cur().type === TT.NEQ) {
+      const op = this.adv().value;
+      e = { type: 'Binary', op, left: e, right: this.comparison() };
+    }
+    return e;
+  }
+  comparison() {
+    let e = this.term();
+    while ([TT.LT, TT.GT, TT.LTE, TT.GTE].includes(this.cur().type)) {
+      const op = this.adv().value;
+      e = { type: 'Binary', op, left: e, right: this.term() };
+    }
+    return e;
+  }
+  term() {
+    let e = this.factor();
+    while (this.cur().type === TT.PLUS || this.cur().type === TT.MINUS) {
+      const op = this.adv().value;
+      e = { type: 'Binary', op, left: e, right: this.factor() };
+    }
+    return e;
+  }
+  factor() {
+    let e = this.unary();
+    while ([TT.STAR, TT.SLASH, TT.PCT, TT.POW].includes(this.cur().type)) {
+      const op = this.adv().value;
+      e = { type: 'Binary', op, left: e, right: this.unary() };
+    }
+    return e;
+  }
+  unary() {
+    if (this.cur().type === TT.MINUS || this.cur().type === TT.NOT) {
+      const op = this.adv().value;
+      return { type: 'Unary', op, arg: this.unary() };
+    }
+    if (this.cur().type === TT.NEW) {
+      this.adv();
+      const callee = this.primary();
+      let args = [];
+      if (this.match(TT.LP)) {
+        if (this.cur().type !== TT.RP) {
+          do { args.push(this.expression()); } while (this.match(TT.COMMA));
+        }
+        this.expect(TT.RP);
+      }
+      return { type: 'New', callee, args };
+    }
+    return this.postfix();
+  }
+  postfix() {
+    let e = this.primary();
+    for (;;) {
+      if (this.match(TT.LP)) {
+        const args = [];
+        if (this.cur().type !== TT.RP) {
+          do {
+            if (this.match(TT.SPREAD)) args.push({ type: 'Spread', expr: this.expression() });
+            else args.push(this.expression());
+          } while (this.match(TT.COMMA));
+        }
+        this.expect(TT.RP);
+        e = { type: 'Call', callee: e, args };
+      } else if (this.match(TT.LB)) {
+        const idx = this.expression();
+        this.expect(TT.RB);
+        e = { type: 'Index', obj: e, index: idx };
+      } else if (this.match(TT.DOT)) {
+        const prop = this.expect(TT.IDENT).value;
+        e = { type: 'Member', obj: e, prop };
+      } else if (this.match(TT.PIPE)) {
+        e = { type: 'Pipe', left: e, right: this.primary() };
+      } else break;
+    }
+    if (this.match(TT.EQ)) {
+      if (e.type !== 'Ident' && e.type !== 'Member' && e.type !== 'Index') throw new Error('Invalid assignment');
+      return { type: 'Assign', target: e, value: this.expression() };
+    }
+    return e;
+  }
+  primary() {
+    const c = this.cur();
+    if (c.type === TT.NUM) { this.adv(); return { type: 'Num', value: c.value }; }
+    if (c.type === TT.STR) { this.adv(); return { type: 'Str', value: c.value }; }
+    if (c.type === TT.TRUE) { this.adv(); return { type: 'Bool', value: true }; }
+    if (c.type === TT.FALSE) { this.adv(); return { type: 'Bool', value: false }; }
+    if (c.type === TT.NIL) { this.adv(); return { type: 'Nil' }; }
+    if (c.type === TT.IDENT) { this.adv(); return { type: 'Ident', name: c.value }; }
+    if (this.match(TT.LP)) { const e = this.expression(); this.expect(TT.RP); return e; }
+    if (this.match(TT.LB)) {
+      const els = [];
+      if (this.cur().type !== TT.RB) {
+        do {
+          if (this.match(TT.SPREAD)) els.push({ type: 'Spread', expr: this.expression() });
+          else els.push(this.expression());
+        } while (this.match(TT.COMMA));
+      }
+      this.expect(TT.RB);
+      return { type: 'List', elements: els };
+    }
+    if (this.match(TT.LC) || this.match(TT.HASHLC)) {
+      const pairs = [];
+      if (this.cur().type !== TT.RC) {
+        do {
+          let key;
+          if (this.cur().type === TT.IDENT) key = { type: 'Str', value: this.adv().value };
+          else key = this.expression();
+          this.expect(TT.COLON);
+          pairs.push({ key, val: this.expression() });
+        } while (this.match(TT.COMMA));
+      }
+      this.expect(TT.RC);
+      return { type: 'Dict', pairs };
+    }
+    if (c.type === TT.FN) return this.fnStmt();
+    throw new Error('Unexpected token ' + c.type + ' at line ' + (c.line || '?'));
+  }
+}
+
+class ReturnSignal { constructor(v) { this.value = v; } }
+class BreakSignal {}
+class ContinueSignal {}
+
+function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
+
+// ─── Pixel (universal store) ───────────────────────────────────────────────
+const PX = {
+  store: new Map(),
+  encode(text, meta) {
+    const h = 'pix_' + Math.abs(hashCode(String(text) + (meta ? JSON.stringify(meta) : ''))).toString(16).padStart(8, '0');
+    this.store.set(h, { text: String(text), meta: meta || {}, ts: HOST.now(), hits: 0 });
+    return h;
+  },
+  decode(h) {
+    const e = this.store.get(h);
+    if (e) { e.hits++; return e; }
+    return null;
+  },
+  search(q) {
+    const qq = String(q).toLowerCase();
+    const out = [];
+    for (const [h, e] of this.store) {
+      const blob = (e.text + ' ' + JSON.stringify(e.meta)).toLowerCase();
+      if (blob.includes(qq)) out.push({ hash: h, text: e.text.slice(0, 80), meta: e.meta, hits: e.hits });
+    }
+    return out.sort((a, b) => b.hits - a.hits);
+  },
+  ingest(kind, name, data) {
+    const payload = typeof data === 'string' ? data : JSON.stringify(data);
+    const meta = { kind: String(kind), name: String(name), bytes: payload.length, ts: HOST.now() };
+    const h = this.encode(payload, meta);
+    return { hash: h, meta };
+  },
+  stats() { return { count: this.store.size }; }
+};
+
+// ─── Module registry ──────────────────────────────────────────────────────
+const MODULES = {
+  registry: new Map(),
+  export(name, api) {
+    name = String(name);
+    this.registry.set(name, { name, api, ts: HOST.now() });
+    return name;
+  },
+  import(name) {
+    const m = this.registry.get(String(name));
+    if (!m) throw new Error('Module not found: ' + name);
+    return m.api;
+  },
+  list() { return [...this.registry.keys()]; },
+  stats() { return { count: this.registry.size, names: this.list() }; }
+};
+const PACKAGE = {
+  name: 'aether-core',
+  version: '1.0.0',
+  license: 'MIT',
+  description: 'Host-agnostic experimental language + continuum runtime',
+  engines: { node: '>=18' }
+};
+
+// ─── Hierarchical FS ──────────────────────────────────────────────────────
+const FS = {
+  nodes: new Map(),
+  normalize(path) {
+    path = String(path || '/');
+    if (!path.startsWith('/')) path = '/' + path;
+    path = path.replace(/\/+/g, '/');
+    if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    return path;
+  },
+  parent(path) {
+    path = this.normalize(path);
+    if (path === '/') return null;
+    const i = path.lastIndexOf('/');
+    return i === 0 ? '/' : path.slice(0, i);
+  },
+  ensureDir(path) {
+    path = this.normalize(path);
+    if (path === '/') {
+      if (!this.nodes.has('/')) this.nodes.set('/', { type: 'dir', children: new Set(), ts: HOST.now() });
+      return;
+    }
+    const parts = path.split('/').filter(Boolean);
+    let cur = '/';
+    this.ensureDir('/');
+    for (const p of parts) {
+      const next = cur === '/' ? '/' + p : cur + '/' + p;
+      if (!this.nodes.has(next)) {
+        this.nodes.set(next, { type: 'dir', children: new Set(), ts: HOST.now() });
+        this.nodes.get(cur).children.add(next);
+      } else if (this.nodes.get(next).type !== 'dir') throw new Error('ENOTDIR: ' + next);
+      cur = next;
+    }
+  },
+  write(path, content, meta) {
+    path = this.normalize(path);
+    const parent = this.parent(path);
+    if (parent) this.ensureDir(parent);
+    const prev = this.nodes.get(path);
+    if (prev && prev.type === 'dir') throw new Error('EISDIR: ' + path);
+    this.nodes.set(path, { type: 'file', content: String(content), meta: meta || {}, ts: HOST.now() });
+    if (parent) this.nodes.get(parent).children.add(path);
+    return path;
+  },
+  read(path) {
+    path = this.normalize(path);
+    const n = this.nodes.get(path);
+    if (!n) throw new Error('ENOENT: ' + path);
+    if (n.type === 'dir') throw new Error('EISDIR: ' + path);
+    return n.content;
+  },
+  mkdir(path) { this.ensureDir(path); return this.normalize(path); },
+  exists(path) { return this.nodes.has(this.normalize(path)); },
+  isDir(path) { const n = this.nodes.get(this.normalize(path)); return n && n.type === 'dir'; },
+  isFile(path) { const n = this.nodes.get(this.normalize(path)); return n && n.type === 'file'; },
+  list(path) {
+    path = this.normalize(path || '/');
+    const n = this.nodes.get(path);
+    if (!n) throw new Error('ENOENT: ' + path);
+    if (n.type !== 'dir') throw new Error('ENOTDIR: ' + path);
+    return [...n.children].sort();
+  },
+  tree(path, depth) {
+    path = this.normalize(path || '/');
+    depth = depth == null ? 8 : depth;
+    const walk = (p, d) => {
+      const n = this.nodes.get(p);
+      if (!n) return null;
+      if (n.type === 'file') return { path: p, type: 'file', bytes: (n.content || '').length, meta: n.meta };
+      const kids = d > 0 ? [...n.children].sort().map(c => walk(c, d - 1)).filter(Boolean) : [];
+      return { path: p, type: 'dir', children: kids };
+    };
+    return walk(path, depth);
+  },
+  remove(path) {
+    path = this.normalize(path);
+    const n = this.nodes.get(path);
+    if (!n) return false;
+    if (n.type === 'dir' && n.children.size) throw new Error('ENOTEMPTY: ' + path);
+    this.nodes.delete(path);
+    const parent = this.parent(path);
+    if (parent && this.nodes.has(parent)) this.nodes.get(parent).children.delete(path);
+    return true;
+  },
+  scan(path) {
+    path = this.normalize(path || '/');
+    const out = [];
+    const walk = (p) => {
+      const n = this.nodes.get(p);
+      if (!n) return;
+      if (n.type === 'file') out.push({ path: p, bytes: (n.content || '').length, meta: n.meta });
+      else for (const c of n.children) walk(c);
+    };
+    walk(path);
+    return out;
+  },
+  toPixel(path) { const content = this.read(path); return PX.ingest('file', path, content); },
+  download(path, content, meta) { return this.write(path, content, { ...(meta || {}), downloaded: true, ts: HOST.now() }); },
+  stats() {
+    let files = 0, dirs = 0, bytes = 0;
+    for (const n of this.nodes.values()) {
+      if (n.type === 'file') { files++; bytes += (n.content || '').length; } else dirs++;
+    }
+    return { files, dirs, bytes, nodes: this.nodes.size };
+  }
+};
+// seed FS
+FS.mkdir('/aether');
+FS.mkdir('/aether/bin');
+FS.mkdir('/aether/lib');
+FS.mkdir('/aether/media');
+FS.mkdir('/aether/media/images');
+FS.mkdir('/aether/media/video');
+FS.mkdir('/aether/media/3d');
+FS.mkdir('/aether/games');
+FS.mkdir('/aether/llm');
+FS.mkdir('/apps');
+FS.write('/aether/README', 'AETHER Core v1.0.0 Foundation\nPixel ingest for any content.');
+FS.write('/aether/bin/apex', 'apex self-test');
+FS.write('/aether/lib/util.ae', 'print("util loaded")\nprint(lib_gcd(12,8))');
+
+// ─── Image / Animation ─────────────────────────────────────────────────────
+const IMAGE = {
+  store: new Map(),
+  create(id, w, h, format) {
+    const img = { id: String(id), w: w | 0 || 256, h: h | 0 || 256, format: format || 'rgba', pixels: (w | 0 || 256) * (h | 0 || 256), ts: HOST.now() };
+    this.store.set(img.id, img);
+    return img;
+  },
+  info(id) { return this.store.get(String(id)) || null; },
+  toPixel(id) { const img = this.info(id); if (!img) throw new Error('No image: ' + id); return PX.ingest('image', id, img); },
+  stats() { return { count: this.store.size }; }
+};
+const ANIM = {
+  timelines: new Map(),
+  create(id, fps, frames) {
+    const t = { id: String(id), fps: fps || 30, frames: frames || 60, tracks: [], ts: HOST.now() };
+    this.timelines.set(t.id, t);
+    return t;
+  },
+  addTrack(id, name, keyframes) {
+    const t = this.timelines.get(String(id));
+    if (!t) throw new Error('No anim: ' + id);
+    t.tracks.push({ name: String(name), keyframes: keyframes || [] });
+    return t.tracks.length;
+  },
+  info(id) { return this.timelines.get(String(id)) || null; },
+  toPixel(id) { const t = this.info(id); if (!t) throw new Error('No anim: ' + id); return PX.ingest('animation', id, t); },
+  stats() { return { count: this.timelines.size }; }
+};
+
+// ─── Media ────────────────────────────────────────────────────────────────
+const MEDIA = {
+  clips: new Map(),
+  scenes: new Map(),
+  streams: { camera: null, mic: null, audio: null },
+  text_analyze(s) {
+    s = String(s);
+    return { words: s.trim() ? s.trim().split(/\s+/).length : 0, chars: s.length, lines: s.split('\n').length };
+  },
+  code_stats(src) {
+    src = String(src);
+    const lines = src.split('\n');
+    return { lines: lines.length, code_lines: lines.filter(l => l.trim() && !l.trim().startsWith('#') && !l.trim().startsWith('//')).length, functions: (src.match(/\bfn\b/g) || []).length, bytes: src.length };
+  },
+  video_create(id, w, h, fps, frames) {
+    const c = { id: String(id), w: w || 1920, h: h || 1080, fps: fps || 30, frames: frames || 90, ts: HOST.now() };
+    this.clips.set(c.id, c);
+    return c;
+  },
+  video_info(id) { return this.clips.get(String(id)) || null; },
+  video_to_pixel(id) { const c = this.video_info(id); if (!c) throw new Error('No video'); return PX.ingest('video', id, c); },
+  scene_create(id) {
+    const sc = { id: String(id), meshes: [], lights: [], camera: { x: 0, y: 0, z: 5, fov: 60 }, ts: HOST.now() };
+    this.scenes.set(sc.id, sc);
+    return sc.id;
+  },
+  scene_add_mesh(id, name, verts) {
+    const sc = this.scenes.get(String(id));
+    if (!sc) throw new Error('No scene');
+    sc.meshes.push({ name: String(name), verts: verts || 8 });
+    return sc.meshes.length;
+  },
+  scene_add_light(id, type, intensity) {
+    const sc = this.scenes.get(String(id));
+    if (!sc) throw new Error('No scene');
+    sc.lights.push({ type: type || 'point', intensity: intensity || 1 });
+    return sc.lights.length;
+  },
+  scene_info(id) { return this.scenes.get(String(id)) || null; },
+  scene_to_pixel(id) { const sc = this.scene_info(id); if (!sc) throw new Error('No scene'); return PX.ingest('3d', id, sc); },
+  camera_open() {
+    if (HOST.hasMedia) { try { /* async */ } catch (e) {} }
+    this.streams.camera = { live: false, simulated: true, w: 640, h: 480 };
+    return this.streams.camera;
+  },
+  camera_frame() {
+    const c = this.streams.camera || { simulated: true };
+    return { w: c.w || 640, h: c.h || 480, format: 'rgb', simulated: !!c.simulated, ts: HOST.now() };
+  },
+  mic_open() { this.streams.mic = { live: false, simulated: true, sample_rate: 44100 }; return this.streams.mic; },
+  mic_level() { return Math.random() * 0.4; },
+  audio_tone(freq, ms) { this.streams.audio = { last_freq: freq || 440, ms: ms || 200, simulated: !HOST.hasAudio }; return this.streams.audio; },
+  stats() { return { clips: this.clips.size, scenes: this.scenes.size, camera: this.streams.camera ? 'on' : 'off', mic: this.streams.mic ? 'on' : 'off', images: IMAGE.stats().count, anims: ANIM.stats().count }; }
+};
+
+// ─── Full VHW rack ─────────────────────────────────────────────────────────
+const VHW = {
+  vGPU: 0, vTPU: 0, vCPU: 0, vRAM: 0, vStorage: 0, vNet: 0, vScraper: 0, vFabric: 0, vGuardian: 0, vQPU: 0, vLPU: 0, vPhoton: 0,
+  compute(n) { n = Math.max(1, n | 0); this.vGPU += n; this.vCPU += Math.floor(n / 100); return n; },
+  attend(n) { n = Math.max(1, n | 0); this.vTPU += n; return n; },
+  alloc(n) { n = Math.max(1, n | 0); this.vRAM += n; return n; },
+  store(n) { n = Math.max(1, n | 0); this.vStorage += n; return n; },
+  send(n) { n = Math.max(1, n | 0); this.vNet += n; return n; },
+  scrape(n) { n = Math.max(1, n | 0); this.vScraper += n; return n; },
+  fabric(n) { n = Math.max(1, n | 0); this.vFabric += n; return n; },
+  guard(n) { n = Math.max(1, n | 0); this.vGuardian += n; return n; },
+  quantum(n) { n = Math.max(1, n | 0); this.vQPU += n; return n; },
+  logic(n) { n = Math.max(1, n | 0); this.vLPU += n; return n; },
+  photon(n) { n = Math.max(1, n | 0); this.vPhoton += n; return n; },
+  stats() { return { vGPU: this.vGPU, vTPU: this.vTPU, vCPU: this.vCPU, vRAM: this.vRAM, vStorage: this.vStorage, vNet: this.vNet, vScraper: this.vScraper, vFabric: this.vFabric, vGuardian: this.vGuardian, vQPU: this.vQPU, vLPU: this.vLPU, vPhoton: this.vPhoton }; }
+};
+
+// ─── Hardware telemetry ────────────────────────────────────────────────────
+const HW = {
+  cpu: { cores: 8, freq_ghz: 3.5, ops: 0 },
+  gpu: { cores: 2048, vram_mb: 8192, ops: 0 },
+  ram: { total_mb: 16384, used_mb: 2048 },
+  ssd: { total_gb: 512, used_gb: 64, iops: 0 },
+  photonics: { channels: 64, wavelength_nm: 1550, ops: 0, efficiency: 0.92 },
+  tick(kind, n) {
+    n = Math.max(1, n | 0);
+    if (kind === 'cpu') this.cpu.ops += n;
+    if (kind === 'gpu') this.gpu.ops += n;
+    if (kind === 'ram') this.ram.used_mb = Math.min(this.ram.total_mb, this.ram.used_mb + n);
+    if (kind === 'ssd') { this.ssd.iops += n; this.ssd.used_gb = Math.min(this.ssd.total_gb, this.ssd.used_gb + n / 1000); }
+    if (kind === 'photon') this.photonics.ops += n;
+    return n;
+  },
+  stats() {
+    return {
+      cpu: this.cpu,
+      gpu: this.gpu,
+      ram: { ...this.ram, free_mb: this.ram.total_mb - this.ram.used_mb },
+      ssd: { ...this.ssd, free_gb: this.ssd.total_gb - this.ssd.used_gb },
+      photonics: this.photonics
+    };
+  }
+};
+
+// ─── Compact remaining engines ─────────────────────────────────────────────
+const FABRIC = {
+  loci: new Map(),
+  dim: 8,
+  put(id, p) {
+    const k = String(id);
+    this.loci.set(k, { coords: Array.from({ length: this.dim }, () => Math.random()), payload: p, ts: HOST.now() });
+    return k;
+  },
+  get(id) { return this.loci.get(String(id)) || null; },
+  search(q) {
+    const qq = String(q).toLowerCase();
+    const out = [];
+    for (const [id, e] of this.loci) if (JSON.stringify(e.payload).toLowerCase().includes(qq) || id.toLowerCase().includes(qq)) out.push({ id, payload: e.payload });
+    return out;
+  },
+  stats() { return { loci: this.loci.size, dim: this.dim }; }
+};
+const Q = {
+  regs: new Map(),
+  gateCount: 0,
+  ctcLoops: 0,
+  create(name, n) {
+    n = Math.max(1, Math.min(8, n | 0));
+    const size = 1 << n;
+    const state = new Float64Array(size * 2);
+    state[0] = 1;
+    this.regs.set(name, { n, size, state });
+    return name;
+  },
+  get(name) { const r = this.regs.get(name); if (!r) throw new Error('No qreg'); return r; },
+  h(name, t) {
+    const reg = this.get(name);
+    const is = 1 / Math.SQRT2;
+    const ns = new Float64Array(reg.size * 2);
+    for (let i = 0; i < reg.size; i++) {
+      const ar = reg.state[i * 2], ai = reg.state[i * 2 + 1];
+      if (!ar && !ai) continue;
+      const bit = (i >> t) & 1;
+      for (let o = 0; o < 2; o++) {
+        const gv = o === 0 ? is : (bit === 0 ? is : -is);
+        let j = i;
+        if (o !== bit) j ^= (1 << t);
+        ns[j * 2] += ar * gv;
+        ns[j * 2 + 1] += ai * gv;
+      }
+    }
+    reg.state = ns;
+    this.gateCount++;
+  },
+  cnot(name, c, t) {
+    const reg = this.get(name);
+    const ns = new Float64Array(reg.size * 2);
+    for (let i = 0; i < reg.size; i++) {
+      const ar = reg.state[i * 2], ai = reg.state[i * 2 + 1];
+      if (!ar && !ai) continue;
+      let j = i;
+      if ((i >> c) & 1) j ^= (1 << t);
+      ns[j * 2] += ar;
+      ns[j * 2 + 1] += ai;
+    }
+    reg.state = ns;
+    this.gateCount++;
+  },
+  probs(name) {
+    const reg = this.get(name);
+    const out = [];
+    for (let i = 0; i < reg.size; i++) {
+      const p = reg.state[i * 2] ** 2 + reg.state[i * 2 + 1] ** 2;
+      if (p > 1e-12) out.push({ state: i.toString(2).padStart(reg.n, '0'), prob: p });
+    }
+    return out.sort((a, b) => b.prob - a.prob);
+  },
+  entropy(name) {
+    let S = 0;
+    for (const p of this.probs(name)) if (p.prob > 0) S -= p.prob * Math.log2(p.prob);
+    return S;
+  },
+  deutsch(name) { this.create(name, 2); /* simplified */ this.h(name, 0); return 'constant'; },
+  ctc(name, rounds) {
+    rounds = Math.max(1, Math.min(16, rounds | 0));
+    this.create(name, 1);
+    this.h(name, 0);
+    this.ctcLoops += rounds;
+    return { rounds, loops: this.ctcLoops };
+  }
+};
+const KOS = {
+  nodes: new Map(),
+  edges: [],
+  add(id, title, type) {
+    const n = { id: String(id), title: String(title), type: type || 'concept' };
+    this.nodes.set(n.id, n);
+    return n.id;
+  },
+  link(a, b, rel) { this.edges.push({ a: String(a), b: String(b), rel: rel || 'related' }); return this.edges.length; },
+  get(id) { return this.nodes.get(String(id)) || null; },
+  neighbors(id) {
+    const out = [];
+    for (const e of this.edges) {
+      if (e.a === String(id)) out.push({ id: e.b, rel: e.rel });
+      if (e.b === String(id)) out.push({ id: e.a, rel: e.rel });
+    }
+    return out;
+  },
+  search(q) {
+    const qq = String(q).toLowerCase();
+    return [...this.nodes.values()].filter(n => n.title.toLowerCase().includes(qq) || n.id.toLowerCase().includes(qq));
+  },
+  stats() { return { nodes: this.nodes.size, edges: this.edges.length }; }
+};
+const MIND = {
+  awake: true,
+  curiosity: 0.88,
+  goals: [],
+  thoughts: [],
+  debates: 0,
+  selfModel: { identity: 'AETHER Core v1.0.0', host: null, capabilities: [] },
+  think(topic) {
+    const t = topic ? 'Reflected on: ' + topic : ['Pixel fabric expanded.', 'FS tree healthy.', 'VHW rack full.', 'Ingest pipeline ready.'][Math.floor(Math.random() * 4)];
+    this.thoughts.push({ t, ts: HOST.now() });
+    if (this.thoughts.length > 60) this.thoughts.shift();
+    return t;
+  },
+  addGoal(g, parent) {
+    const goal = { id: this.goals.length + 1, g: String(g), parent: parent || null, ts: HOST.now() };
+    this.goals.push(goal);
+    return goal.id;
+  },
+  debate(topic) {
+    this.debates++;
+    const agents = ['Architect', 'Critic', 'Quantum', 'Fabric', 'Guardian', 'Kernel', 'Photon', 'Media'];
+    const winner = agents[Math.floor(Math.random() * agents.length)];
+    const s = '[' + winner + '] debated "' + topic + '"';
+    this.thoughts.push({ t: s, ts: HOST.now() });
+    return s;
+  },
+  updateSelf(caps) {
+    this.selfModel.host = HOST.kind;
+    if (Array.isArray(caps)) this.selfModel.capabilities = caps;
+    else if (caps) this.selfModel.capabilities.push(String(caps));
+    return this.selfModel;
+  },
+  status() {
+    return {
+      awake: this.awake,
+      curiosity: this.curiosity,
+      goals: this.goals.length,
+      debates: this.debates,
+      recent: this.thoughts.slice(-4).map(x => x.t),
+      self_model: this.selfModel
+    };
+  }
+};
+const KERNEL = {
+  bootTime: HOST.boot,
+  services: new Map(),
+  syscalls: 0,
+  register(name, handler) { this.services.set(String(name), { name: String(name), handler, calls: 0 }); return name; },
+  call(name, ...args) {
+    const s = this.services.get(String(name));
+    if (!s) throw new Error('Unknown service: ' + name);
+    s.calls++;
+    this.syscalls++;
+    return typeof s.handler === 'function' ? s.handler(...args) : null;
+  },
+  list() { return [...this.services.keys()]; },
+  uptime() { return HOST.now() - this.bootTime; },
+  status() { return { uptime_ms: this.uptime(), services: this.services.size, syscalls: this.syscalls, service_list: this.list() }; }
+};
+KERNEL.register('echo', x => x);
+KERNEL.register('time', () => HOST.now());
+KERNEL.register('host', () => HOST.kind);
+KERNEL.register('heartbeat', () => ({ ok: true, uptime: KERNEL.uptime() }));
+KERNEL.register('hw', () => HW.stats());
+KERNEL.register('fs', () => FS.stats());
+const OS = {
+  env: { AETHER_VERSION: '1.0.0', HOST: HOST.kind },
+  processes: new Map(),
+  nextPid: 1,
+  spawn(name, meta) {
+    const pid = this.nextPid++;
+    this.processes.set(pid, { pid, name: String(name), meta: meta || {}, ts: HOST.now(), status: 'running' });
+    return pid;
+  },
+  kill(pid) {
+    const p = this.processes.get(pid);
+    if (p) { p.status = 'killed'; return true; }
+    return false;
+  },
+  ps() { return [...this.processes.values()]; },
+  getenv(k) { return this.env[k] || null; },
+  setenv(k, v) { this.env[String(k)] = String(v); return v; },
+  status() { return { processes: this.processes.size, env_keys: Object.keys(this.env).length, fs: FS.stats() }; }
+};
+OS.spawn('init', { role: 'kernel' });
+OS.spawn('pixel-ingest', { role: 'engine' });
+const WASM = {
+  modules: new Map(),
+  emitWat(name, expr) {
+    const wat = `(module\n  (func (export "${name}") (result i32)\n    ${expr || 'i32.const 42'}\n  )\n)`;
+    const id = 'wasm_' + Math.abs(hashCode(name)).toString(16);
+    this.modules.set(id, { name, wat });
+    return { id, wat };
+  },
+  emitHeader(name) {
+    const hex = '00 61 73 6d 01 00 00 00';
+    const id = 'wasm_hdr_' + String(name);
+    this.modules.set(id, { name, header: hex });
+    return { id, header: hex };
+  },
+  list() { return [...this.modules.entries()].map(([id, m]) => ({ id, name: m.name })); },
+  get(id) { return this.modules.get(id) || null; },
+  stats() { return { modules: this.modules.size }; }
+};
+const LIB = {
+  version: '1.2.0-aether-stdlib',
+  gcd(a, b) {
+    a = Math.abs(a | 0);
+    b = Math.abs(b | 0);
+    while (b) { const t = b; b = a % b; a = t; }
+    return a;
+  },
+  fib(n) {
+    n = n | 0;
+    if (n < 2) return n;
+    let a = 0, b = 1;
+    for (let i = 2; i <= n; i++) { const c = a + b; a = b; b = c; }
+    return b;
+  },
+  factorial(n) {
+    n = n | 0;
+    if (n < 0) return null;
+    let r = 1;
+    for (let i = 2; i <= n; i++) r *= i;
+    return r;
+  },
+  is_prime(n) {
+    n = n | 0;
+    if (n < 2) return false;
+    if (n < 4) return true;
+    if (n % 2 === 0 || n % 3 === 0) return false;
+    for (let i = 5; i * i <= n; i += 6) if (n % i === 0 || n % (i + 2) === 0) return false;
+    return true;
+  }
+};
+const GAMES = {
+  registry: new Map(),
+  register(id, title) { this.registry.set(String(id), { id: String(id), title: String(title), ts: HOST.now() }); return id; },
+  list() { return [...this.registry.values()]; },
+  toPixel(id) { const g = this.registry.get(String(id)); if (!g) throw new Error('No game'); return PX.ingest('game', id, g); },
+  stats() { return { count: this.registry.size }; }
+};
+const LLM = {
+  sessions: new Map(),
+  start(id, model) {
+    const s = { id: String(id), model: model || 'aether-mesh', msgs: 0, ts: HOST.now() };
+    this.sessions.set(s.id, s);
+    return s;
+  },
+  prompt(id, text) {
+    const s = this.sessions.get(String(id));
+    if (!s) throw new Error('No session');
+    s.msgs++;
+    return { reply: '[mesh] acknowledged: ' + String(text).slice(0, 60), session: s.id };
+  },
+  toPixel(id) { const s = this.sessions.get(String(id)); if (!s) throw new Error('No session'); return PX.ingest('llm', id, s); },
+  stats() { return { sessions: this.sessions.size }; }
+};
+
+const DOCS = {
+  topics: {
+    language: `Aether OMEGA: let/mut/const fn if/else while for break/continue match struct class try/catch ternary pipe spread new import`,
+    fs: `Filesystem (hierarchical)
+  fs_mkdir fs_write fs_read fs_exists fs_isdir fs_isfile
+  fs_list fs_tree fs_scan fs_remove fs_download
+  fs_to_pixel  — any file → pixel fabric
+  fs_stats`,
+    pixel: `Pixel universal store
+  px_store px_get px_search px_stats
+  px_ingest(kind,name,data) — any content type
+  kinds: file image video 3d animation game llm app os code text`,
+    image: `Image: img_create img_info img_to_pixel img_stats`,
+    anim: `Animation: anim_create anim_add_track anim_info anim_to_pixel anim_stats`,
+    media: `Media: text_analyze code_stats video_* scene_* camera_* mic_* audio_tone media_stats
+  video_to_pixel scene_to_pixel`,
+    vhw: `Full VHW rack:
+  vhw_compute(vGPU) vhw_attend(vTPU) vhw_alloc(vRAM) vhw_store(vStorage)
+  vhw_send(vNet) vhw_scrape vhw_fabric vhw_guard
+  vhw_quantum(vQPU) vhw_logic(vLPU) vhw_photon vhw_stat`,
+    hardware: `hw_cpu hw_gpu hw_ram hw_ssd hw_photon hw_tick hw_stats`,
+    games: `game_register game_list game_to_pixel game_stats`,
+    llm: `llm_start llm_prompt llm_to_pixel llm_stats`,
+    kernel: `kern_register kern_call kern_list kern_status kern_uptime`,
+    os: `proc_spawn proc_kill proc_ps env_get env_set os_status`,
+    wasm: `wasm_emit_wat wasm_header wasm_list wasm_stats`,
+    library: `lib_gcd lib_fib lib_factorial lib_is_prime lib_version`,
+    continuum: `fab_* q* kos_* mind_*`,
+    modules: `Modules
+  module_export(name, api_dict)
+  import_module(name)  — binds name in globals
+  module_list module_stats
+  package_info() — name version license`,
+    publish: `Publish pack: LICENSE README.md LANGUAGE.md aether.cjs examples/
+  CLI: node aether.cjs test|run|eval|repl|status|version
+  Honesty: FS/OS/HW/media simulations — see README`,
+    help: `help("topic") topics: language fs pixel image anim media vhw hardware games llm kernel os wasm library continuum modules publish all`
+  },
+  help(topic) { if (!topic || topic === 'all') return Object.keys(this.topics).map(k => '## ' + k + '\n' + this.topics[k]).join('\n\n'); return this.topics[String(topic).toLowerCase()] || ('Unknown. ' + Object.keys(this.topics).join(', ')); },
+  list() { return Object.keys(this.topics); }
+};
+
+// ─── Interpreter ───────────────────────────────────────────────────────────
+class Interpreter {
+  constructor() {
+    this.globals = new Map();
+    this.structs = new Map();
+    this.classes = new Map();
+    this.out = [];
+    this.installBuiltins();
+  }
+  log(...a) {
+    const s = a.map(x => this.str(x)).join(' ');
+    this.out.push(s);
+    return s;
+  }
+  str(v) {
+    if (v === null || v === undefined) return 'nil';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    if (Array.isArray(v)) return '[' + v.map(x => this.str(x)).join(', ') + ']';
+    if (typeof v === 'function') return '<fn>';
+    if (v && v.__class) return '<' + v.__class + '>';
+    if (v && v.__struct) return '<' + v.__struct + '>';
+    if (typeof v === 'object') { try { return JSON.stringify(v); } catch (e) { return String(v); } }
+    return String(v);
+  }
+  installBuiltins() {
+    const b = this.globals;
+    const bind = (n, f) => b.set(n, f);
+    bind('print', (...a) => this.log(...a));
+    bind('str', x => this.str(x));
+    bind('int', x => Number(x) | 0);
+    bind('float', x => Number(x));
+    bind('bool', x => !!x);
+    bind('type', x => {
+      if (x === null || x === undefined) return 'nil';
+      if (Array.isArray(x)) return 'list';
+      if (x && x.__struct) return 'struct';
+      if (x && x.__class) return 'class';
+      if (typeof x === 'object') return 'dict';
+      return typeof x;
+    });
+    bind('len', x => (x && x.length !== undefined) ? x.length : (x && typeof x === 'object' ? Object.keys(x).length : 0));
+    bind('range', (a, bb) => {
+      if (bb === undefined) { bb = a; a = 0; }
+      const r = [];
+      for (let i = a; i < bb; i++) r.push(i);
+      return r;
+    });
+    bind('push', (a, v) => { if (Array.isArray(a)) a.push(v); return a; });
+    bind('pop', a => Array.isArray(a) ? a.pop() : null);
+    bind('keys', d => d && typeof d === 'object' ? Object.keys(d) : []);
+    bind('values', d => d && typeof d === 'object' ? Object.values(d) : []);
+    bind('map', (arr, fn) => Array.isArray(arr) && typeof fn === 'function' ? arr.map((x, i) => fn(x, i)) : []);
+    bind('filter', (arr, fn) => Array.isArray(arr) && typeof fn === 'function' ? arr.filter((x, i) => fn(x, i)) : []);
+    bind('reduce', (arr, fn, init) => Array.isArray(arr) && typeof fn === 'function' ? arr.reduce((acc, x, i) => fn(acc, x, i), init) : init);
+    bind('join', (arr, sep) => Array.isArray(arr) ? arr.map(x => String(x)).join(sep == null ? ',' : String(sep)) : '');
+    bind('split', (s, sep) => String(s).split(sep == null ? '' : String(sep)));
+    bind('slice', (a, s, e) => (Array.isArray(a) || typeof a === 'string') ? a.slice(s, e) : null);
+    bind('sort', a => Array.isArray(a) ? [...a].sort((x, y) => (x > y) - (x < y)) : a);
+    bind('reverse', a => Array.isArray(a) ? [...a].reverse() : a);
+    bind('includes', (a, v) => Array.isArray(a) ? a.includes(v) : (typeof a === 'string' ? a.includes(String(v)) : false));
+    bind('upper', s => String(s).toUpperCase());
+    bind('lower', s => String(s).toLowerCase());
+    bind('trim', s => String(s).trim());
+    bind('replace', (s, a, b) => String(s).split(String(a)).join(String(b)));
+    bind('starts_with', (s, p) => String(s).startsWith(String(p)));
+    bind('ends_with', (s, p) => String(s).endsWith(String(p)));
+    bind('min', (...a) => Math.min(...a.map(Number)));
+    bind('max', (...a) => Math.max(...a.map(Number)));
+    bind('abs', Math.abs);
+    bind('floor', Math.floor);
+    bind('ceil', Math.ceil);
+    bind('round', Math.round);
+    bind('sqrt', Math.sqrt);
+    bind('sin', Math.sin);
+    bind('cos', Math.cos);
+    bind('pow', Math.pow);
+    bind('log', Math.log);
+    bind('exp', Math.exp);
+    bind('clamp', (x, lo, hi) => Math.max(lo, Math.min(hi, x)));
+    bind('lerp', (a, b, t) => a + (b - a) * t);
+    bind('rand', () => Math.random());
+    bind('time', () => HOST.now());
+    bind('uptime', () => HOST.now() - HOST.boot);
+    bind('to_json', x => JSON.stringify(x));
+    bind('from_json', s => JSON.parse(String(s)));
+    // FS
+    bind('fs_mkdir', p => FS.mkdir(p));
+    bind('fs_write', (p, c, m) => FS.write(p, c, m));
+    bind('fs_read', p => FS.read(p));
+    bind('fs_exists', p => FS.exists(p));
+    bind('fs_isdir', p => FS.isDir(p));
+    bind('fs_isfile', p => FS.isFile(p));
+    bind('fs_list', p => FS.list(p));
+    bind('fs_tree', (p, d) => FS.tree(p, d));
+    bind('fs_scan', p => FS.scan(p));
+    bind('fs_remove', p => FS.remove(p));
+    bind('fs_download', (p, c, m) => FS.download(p, c, m));
+    bind('fs_to_pixel', p => { const r = FS.toPixel(p); this.log('File→pixel ' + r.hash); return r; });
+    bind('fs_stats', () => FS.stats());
+    // Pixel
+    bind('px_store', t => { const h = PX.encode(t); this.log('Stored → ' + h); return h; });
+    bind('px_get', h => { const e = PX.decode(h); return e ? e.text : null; });
+    bind('px_search', q => PX.search(q));
+    bind('px_ingest', (kind, name, data) => { const r = PX.ingest(kind, name, data); this.log('Ingest ' + kind + ' → ' + r.hash); return r; });
+    bind('px_stats', () => PX.stats());
+    // Image / Anim
+    bind('img_create', (id, w, h, fmt) => { const i = IMAGE.create(id, w, h, fmt); this.log('Image ' + i.id + ' ' + i.w + 'x' + i.h); return i; });
+    bind('img_info', id => IMAGE.info(id));
+    bind('img_to_pixel', id => { const r = IMAGE.toPixel(id); this.log('Image→pixel ' + r.hash); return r; });
+    bind('img_stats', () => IMAGE.stats());
+    bind('anim_create', (id, fps, frames) => { const t = ANIM.create(id, fps, frames); this.log('Anim ' + t.id); return t; });
+    bind('anim_add_track', (id, name, kf) => ANIM.addTrack(id, name, kf));
+    bind('anim_info', id => ANIM.info(id));
+    bind('anim_to_pixel', id => { const r = ANIM.toPixel(id); this.log('Anim→pixel ' + r.hash); return r; });
+    bind('anim_stats', () => ANIM.stats());
+    // Media
+    bind('text_analyze', s => MEDIA.text_analyze(s));
+    bind('code_stats', s => MEDIA.code_stats(s));
+    bind('video_create', (id, w, h, fps, frames) => { const c = MEDIA.video_create(id, w, h, fps, frames); this.log('Video ' + c.id); return c; });
+    bind('video_info', id => MEDIA.video_info(id));
+    bind('video_to_pixel', id => { const r = MEDIA.video_to_pixel(id); this.log('Video→pixel ' + r.hash); return r; });
+    bind('scene_create', id => { const s = MEDIA.scene_create(id); this.log('Scene ' + s); return s; });
+    bind('scene_add_mesh', (id, name, v) => MEDIA.scene_add_mesh(id, name, v));
+    bind('scene_add_light', (id, t, i) => MEDIA.scene_add_light(id, t, i));
+    bind('scene_info', id => MEDIA.scene_info(id));
+    bind('scene_to_pixel', id => { const r = MEDIA.scene_to_pixel(id); this.log('3D→pixel ' + r.hash); return r; });
+    bind('camera_open', () => MEDIA.camera_open());
+    bind('camera_frame', () => MEDIA.camera_frame());
+    bind('mic_open', () => MEDIA.mic_open());
+    bind('mic_level', () => MEDIA.mic_level());
+    bind('audio_tone', (f, ms) => MEDIA.audio_tone(f, ms));
+    bind('media_stats', () => MEDIA.stats());
+    // VHW
+    bind('vhw_compute', n => VHW.compute(n));
+    bind('vhw_attend', n => VHW.attend(n));
+    bind('vhw_alloc', n => VHW.alloc(n));
+    bind('vhw_store', n => VHW.store(n));
+    bind('vhw_send', n => VHW.send(n));
+    bind('vhw_scrape', n => VHW.scrape(n));
+    bind('vhw_fabric', n => VHW.fabric(n));
+    bind('vhw_guard', n => VHW.guard(n));
+    bind('vhw_quantum', n => VHW.quantum(n));
+    bind('vhw_logic', n => VHW.logic(n));
+    bind('vhw_photon', n => VHW.photon(n));
+    bind('vhw_stat', () => VHW.stats());
+    // HW
+    bind('hw_cpu', n => { HW.tick('cpu', n || 1); return HW.cpu; });
+    bind('hw_gpu', n => { HW.tick('gpu', n || 1); return HW.gpu; });
+    bind('hw_ram', n => { HW.tick('ram', n || 1); return HW.ram; });
+    bind('hw_ssd', n => { HW.tick('ssd', n || 1); return HW.ssd; });
+    bind('hw_photon', n => { HW.tick('photon', n || 1); return HW.photonics; });
+    bind('hw_tick', (k, n) => HW.tick(String(k), n || 1));
+    bind('hw_stats', () => HW.stats());
+    // Games / LLM
+    bind('game_register', (id, title) => { const r = GAMES.register(id, title); this.log('Game ' + r); return r; });
+    bind('game_list', () => GAMES.list());
+    bind('game_to_pixel', id => { const r = GAMES.toPixel(id); this.log('Game→pixel ' + r.hash); return r; });
+    bind('game_stats', () => GAMES.stats());
+    bind('llm_start', (id, model) => { const s = LLM.start(id, model); this.log('LLM session ' + s.id); return s; });
+    bind('llm_prompt', (id, text) => LLM.prompt(id, text));
+    bind('llm_to_pixel', id => { const r = LLM.toPixel(id); this.log('LLM→pixel ' + r.hash); return r; });
+    bind('llm_stats', () => LLM.stats());
+    // continuum
+    bind('fab_put', (id, p) => { const k = FABRIC.put(id, p); this.log('Fabric ' + k); return k; });
+    bind('fab_get', id => FABRIC.get(id));
+    bind('fab_search', q => FABRIC.search(q));
+    bind('fab_stats', () => FABRIC.stats());
+    bind('qreg', (n, q) => { Q.create(String(n), Number(q) || 1); this.log('Register ' + n); return n; });
+    bind('qh', (n, t) => { Q.h(String(n), Number(t) || 0); return null; });
+    bind('qcnot', (n, c, t) => { Q.cnot(String(n), Number(c) || 0, Number(t) || 1); return null; });
+    bind('qprob', n => { const p = Q.probs(String(n)); this.log(p.map(x => x.state + ': ' + (x.prob * 100).toFixed(1) + '%').join('\n')); return p; });
+    bind('qentropy', n => { const s = Q.entropy(String(n)); this.log('S=' + s.toFixed(4)); return s; });
+    bind('qdeutsch', n => { const r = Q.deutsch(String(n || 'dj')); this.log('Deutsch→' + r); return r; });
+    bind('qctc', (n, r) => { const x = Q.ctc(String(n || 'ctc'), r || 4); this.log('CTC loops=' + x.loops); return x; });
+    bind('kos_add', (id, title, type) => { const i = KOS.add(id, title, type); this.log('KOS +' + i); return i; });
+    bind('kos_link', (a, b, rel) => KOS.link(a, b, rel));
+    bind('kos_get', id => KOS.get(id));
+    bind('kos_neighbors', id => KOS.neighbors(id));
+    bind('kos_search', q => KOS.search(q));
+    bind('kos_stats', () => KOS.stats());
+    bind('mind_think', t => { const r = MIND.think(t); this.log('Mind: ' + r); return r; });
+    bind('mind_status', () => MIND.status());
+    bind('mind_goal', (g, p) => MIND.addGoal(g, p));
+    bind('mind_debate', t => { const r = MIND.debate(t || 'open'); this.log(r); return r; });
+    bind('mind_self', c => MIND.updateSelf(c));
+    // kernel os wasm lib docs
+    bind('kern_register', (n, f) => KERNEL.register(n, f));
+    bind('kern_call', (n, ...a) => KERNEL.call(n, ...a));
+    bind('kern_list', () => KERNEL.list());
+    bind('kern_status', () => KERNEL.status());
+    bind('kern_uptime', () => KERNEL.uptime());
+    bind('proc_spawn', (n, m) => OS.spawn(n, m));
+    bind('proc_kill', p => OS.kill(p));
+    bind('proc_ps', () => OS.ps());
+    bind('env_get', k => OS.getenv(k));
+    bind('env_set', (k, v) => OS.setenv(k, v));
+    bind('os_status', () => OS.status());
+    bind('wasm_emit_wat', (n, e) => { const r = WASM.emitWat(n, e); this.log('WAT ' + r.id); return r; });
+    bind('wasm_header', n => { const r = WASM.emitHeader(n || 'mod'); this.log('WASM ' + r.header); return r; });
+    bind('wasm_list', () => WASM.list());
+    bind('wasm_stats', () => WASM.stats());
+    bind('help', t => { const h = DOCS.help(t); this.log(h); return h; });
+    bind('docs_list', () => DOCS.list());
+    bind('lib_gcd', (a, b) => LIB.gcd(a, b));
+    bind('lib_fib', n => LIB.fib(n));
+    bind('lib_factorial', n => LIB.factorial(n));
+    bind('lib_is_prime', n => LIB.is_prime(n));
+    bind('lib_version', () => LIB.version);
+    bind('module_export', (name, api) => { const n = MODULES.export(name, api); this.log('module export ' + n); return n; });
+    bind('import_module', (name) => {
+      const api = MODULES.import(name);
+      this.globals.set(String(name), { value: api, mutable: false });
+      this.log('import_module ' + name);
+      return api;
+    });
+    bind('module_list', () => MODULES.list());
+    bind('module_stats', () => MODULES.stats());
+    bind('package_info', () => PACKAGE);
+    bind('lib_zip', (a, b) => {
+      if (!Array.isArray(a) || !Array.isArray(b)) return [];
+      const n = Math.min(a.length, b.length);
+      const out = [];
+      for (let i = 0; i < n; i++) out.push([a[i], b[i]]);
+      return out;
+    });
+    bind('lib_unique', a => Array.isArray(a) ? [...new Set(a)] : []);
+    bind('lib_flatten', a => Array.isArray(a) ? a.flat(Infinity) : []);
+    bind('lib_enumerate', a => Array.isArray(a) ? a.map((x, i) => [i, x]) : []);
+    bind('lib_repeat', (s, n) => { n = Math.max(0, n | 0); return String(s).repeat(n); });
+    bind('lib_pad', (s, n, ch) => { s = String(s); n = n | 0; ch = ch == null ? ' ' : String(ch); return s.length >= n ? s : s + ch.repeat(n - s.length); });
+    bind('lib_sorted', (a, fn) => {
+      if (!Array.isArray(a)) return [];
+      const b = [...a];
+      if (typeof fn === 'function') b.sort((x, y) => { const r = fn(x, y); return r > 0 ? 1 : r < 0 ? -1 : 0; });
+      else b.sort((x, y) => (x > y) - (x < y));
+      return b;
+    });
+    bind('lib_sum', a => Array.isArray(a) ? a.reduce((s, x) => s + Number(x), 0) : 0);
+    bind('lib_avg', a => { if (!Array.isArray(a) || !a.length) return 0; return a.reduce((s, x) => s + Number(x), 0) / a.length; });
+    bind('lib_chunk', (a, n) => { if (!Array.isArray(a)) return []; n = Math.max(1, n | 0); const out = []; for (let i = 0; i < a.length; i += n) out.push(a.slice(i, i + n)); return out; });
+    bind('now_iso', () => new Date().toISOString());
+    bind('format', (tpl, ...args) => { let i = 0; return String(tpl).replace(/\{\}/g, () => String(args[i++] ?? '')); });
+    bind('host_kind', () => HOST.kind);
+    bind('assert', (c, m) => { if (!c) throw new Error(m || 'assertion failed'); return true; });
+    bind('apex', () => AETHER_CORE.selfTest());
+    bind('eval_aether', code => { const r = AETHER_CORE.run(String(code)); if (!r.ok) throw new Error(r.error); for (const line of r.output) this.log(line); return r.result; });
+  }
+  run(code) {
+    this.out = [];
+    const tokens = new Lexer(code).tokenize();
+    const ast = new Parser(tokens).parse();
+    try {
+      this.exec(ast, this.globals);
+    } catch (e) {
+      if (e instanceof ReturnSignal) return e.value;
+      throw e;
+    }
+    return null;
+  }
+  exec(node, env) {
+    if (!node) return null;
+    switch (node.type) {
+      case 'Program': { let last = null; for (const s of node.body) last = this.exec(s, env); return last; }
+      case 'Block': { const child = new Map(env); let last = null; for (const s of node.stmts) last = this.exec(s, child); return last; }
+      case 'Let': { const v = node.value ? this.eval(node.value, env) : null; env.set(node.name, { value: v, mutable: node.mutable !== false && !node.isConst }); return v; }
+      case 'Fn': { const fn = this.makeFn(node, env); if (node.name) env.set(node.name, { value: fn, mutable: false }); return fn; }
+      case 'ExprStmt': return this.eval(node.expr, env);
+      case 'Return': throw new ReturnSignal(node.expr ? this.eval(node.expr, env) : null);
+      case 'Break': throw new BreakSignal();
+      case 'Continue': throw new ContinueSignal();
+      case 'If': { if (this.truthy(this.eval(node.cond, env))) return this.exec(node.then, env); if (node.else) return this.exec(node.else, env); return null; }
+      case 'While': { let g = 1e6; while (this.truthy(this.eval(node.cond, env)) && g-- > 0) { try { this.exec(node.body, env); } catch (e) { if (e instanceof BreakSignal) break; if (e instanceof ContinueSignal) continue; throw e; } } return null; }
+      case 'For': {
+        const iter = this.eval(node.iter, env);
+        const list = Array.isArray(iter) ? iter : (typeof iter === 'number' ? Array.from({ length: iter }, (_, i) => i) : []);
+        for (const item of list) {
+          env.set(node.name, { value: item, mutable: true });
+          try { this.exec(node.body, env); } catch (e) { if (e instanceof BreakSignal) break; if (e instanceof ContinueSignal) continue; throw e; }
+        }
+        return null;
+      }
+      case 'Match': {
+        const t = this.eval(node.target, env);
+        for (const arm of node.arms) {
+          if (arm.pat.type === 'Wildcard') return this.exec(arm.body, env);
+          if (this.eq(t, this.eval(arm.pat, env))) return this.exec(arm.body, env);
+        }
+        return null;
+      }
+      case 'Struct': {
+        this.structs.set(node.name, node.fields);
+        env.set(node.name, { value: (...args) => { const fields = {}; node.fields.forEach((f, i) => { fields[f] = args[i]; }); return { __struct: node.name, fields }; }, mutable: false });
+        return null;
+      }
+      case 'Class': {
+        const methodMap = {};
+        for (const m of node.methods) methodMap[m.name] = m;
+        const self = this;
+        const ctor = function (...args) {
+          const inst = { __class: node.name, fields: {} };
+          for (const [mn, mnode] of Object.entries(methodMap)) inst[mn] = self.makeMethod(mnode, env, inst);
+          if (inst.init) inst.init(...args);
+          return inst;
+        };
+        env.set(node.name, { value: ctor, mutable: false });
+        return null;
+      }
+      case 'Import': {
+        const path = node.path;
+        if (FS.exists(path) && FS.isFile(path)) {
+          const code = FS.read(path);
+          this.log('import ' + path);
+          try { this.run(code); } catch (e) { this.log('import error: ' + e.message); }
+        } else this.log('import ' + path + ' (missing)');
+        return null;
+      }
+      case 'Try': {
+        try { return this.exec(node.tryBody, env); } catch (e) {
+          if (e instanceof ReturnSignal || e instanceof BreakSignal || e instanceof ContinueSignal) throw e;
+          const child = new Map(env);
+          child.set(node.catchVar, { value: String(e.message || e), mutable: true });
+          return this.exec(node.catchBody, child);
+        }
+      }
+      default: throw new Error('Unknown stmt: ' + node.type);
+    }
+  }
+  makeFn(node, env) {
+    const self = this;
+    return function (...args) {
+      const local = new Map(env);
+      node.params.forEach((p, i) => local.set(p, { value: args[i] !== undefined ? args[i] : null, mutable: true }));
+      if (node.rest) local.set(node.rest, { value: args.slice(node.params.length), mutable: true });
+      try { return self.exec(node.body, local); } catch (e) { if (e instanceof ReturnSignal) return e.value; throw e; }
+    };
+  }
+  makeMethod(node, env, inst) {
+    const self = this;
+    return function (...args) {
+      const local = new Map(env);
+      local.set('this', { value: inst, mutable: false });
+      node.params.forEach((p, i) => local.set(p, { value: args[i] !== undefined ? args[i] : null, mutable: true }));
+      try { return self.exec(node.body, local); } catch (e) { if (e instanceof ReturnSignal) return e.value; throw e; }
+    };
+  }
+  eval(node, env) {
+    if (!node) return null;
+    switch (node.type) {
+      case 'Num': return node.value;
+      case 'Str': return node.value;
+      case 'Bool': return node.value;
+      case 'Nil': return null;
+      case 'Ident': {
+        if (env.has(node.name)) { const b = env.get(node.name); return (b && typeof b === 'object' && 'value' in b) ? b.value : b; }
+        if (this.globals.has(node.name)) { const b = this.globals.get(node.name); return (b && typeof b === 'object' && 'value' in b) ? b.value : b; }
+        throw new Error('Undefined: ' + node.name);
+      }
+      case 'List': {
+        const out = [];
+        for (const el of node.elements) {
+          if (el && el.type === 'Spread') { const v = this.eval(el.expr, env); if (Array.isArray(v)) out.push(...v); else out.push(v); }
+          else out.push(this.eval(el, env));
+        }
+        return out;
+      }
+      case 'Dict': {
+        const d = {};
+        for (const p of node.pairs) d[String(this.eval(p.key, env))] = this.eval(p.val, env);
+        return d;
+      }
+      case 'Unary': {
+        const a = this.eval(node.arg, env);
+        if (node.op === '-') return -a;
+        if (node.op === '!') return !this.truthy(a);
+        return a;
+      }
+      case 'Binary': {
+        const l = this.eval(node.left, env);
+        if (node.op === '&&') return this.truthy(l) ? this.eval(node.right, env) : l;
+        if (node.op === '||') return this.truthy(l) ? l : this.eval(node.right, env);
+        const r = this.eval(node.right, env);
+        switch (node.op) {
+          case '+': return (typeof l === 'string' || typeof r === 'string') ? String(l) + String(r) : l + r;
+          case '-': return l - r;
+          case '*': return l * r;
+          case '/': return l / r;
+          case '%': return l % r;
+          case '**': return Math.pow(l, r);
+          case '==': return this.eq(l, r);
+          case '!=': return !this.eq(l, r);
+          case '<': return l < r;
+          case '>': return l > r;
+          case '<=': return l <= r;
+          case '>=': return l >= r;
+          default: throw new Error('op ' + node.op);
+        }
+      }
+      case 'Ternary': return this.truthy(this.eval(node.cond, env)) ? this.eval(node.then, env) : this.eval(node.else, env);
+      case 'Assign': {
+        const v = this.eval(node.value, env);
+        if (node.target.type === 'Ident') {
+          const name = node.target.name;
+          if (env.has(name)) {
+            const b = env.get(name);
+            if (b && typeof b === 'object' && 'mutable' in b) { if (!b.mutable) throw new Error('Immutable'); b.value = v; } else env.set(name, { value: v, mutable: true });
+          } else env.set(name, { value: v, mutable: true });
+          return v;
+        }
+        if (node.target.type === 'Member') {
+          const obj = this.eval(node.target.obj, env);
+          if (obj && obj.__struct) obj.fields[node.target.prop] = v;
+          else if (obj && obj.__class) obj.fields[node.target.prop] = v;
+          else if (obj && typeof obj === 'object') obj[node.target.prop] = v;
+          return v;
+        }
+        if (node.target.type === 'Index') {
+          const obj = this.eval(node.target.obj, env);
+          const idx = this.eval(node.target.index, env);
+          if (Array.isArray(obj) || (obj && typeof obj === 'object')) obj[idx] = v;
+          return v;
+        }
+        throw new Error('Bad assign');
+      }
+      case 'Call': {
+        const callee = this.eval(node.callee, env);
+        const args = [];
+        for (const a of node.args) {
+          if (a && a.type === 'Spread') { const v = this.eval(a.expr, env); if (Array.isArray(v)) args.push(...v); else args.push(v); }
+          else args.push(this.eval(a, env));
+        }
+        if (typeof callee === 'function') return callee(...args);
+        throw new Error('Not callable');
+      }
+      case 'New': {
+        const ctor = this.eval(node.callee, env);
+        const args = node.args.map(a => this.eval(a, env));
+        if (typeof ctor === 'function') return ctor(...args);
+        throw new Error('new needs ctor');
+      }
+      case 'Member': {
+        const obj = this.eval(node.obj, env);
+        if (obj == null) throw new Error('nil property');
+        if (obj.__struct) return obj.fields[node.prop];
+        if (obj.__class && obj.fields && node.prop in obj.fields) return obj.fields[node.prop];
+        return obj[node.prop];
+      }
+      case 'Index': {
+        const obj = this.eval(node.obj, env);
+        const idx = this.eval(node.index, env);
+        if (obj == null) throw new Error('nil index');
+        return obj[idx];
+      }
+      case 'Pipe': {
+        const l = this.eval(node.left, env);
+        const r = this.eval(node.right, env);
+        if (typeof r === 'function') return r(l);
+        throw new Error('Pipe needs fn');
+      }
+      case 'Fn': return this.makeFn(node, env);
+      default: throw new Error('Unknown expr: ' + node.type);
+    }
+  }
+  truthy(v) { return !(v === false || v === null || v === undefined || v === 0 || v === '' || (Array.isArray(v) && v.length === 0)); }
+  eq(a, b) {
+    if (a === b) return true;
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!this.eq(a[i], b[i])) return false;
+      return true;
+    }
+    return false;
+  }
+}
+
+const AETHER_CORE = {
+  version: '1.0.0',
+  host: HOST.kind,
+  Interpreter,
+  Lexer,
+  Parser,
+  PX,
+  FS,
+  IMAGE,
+  ANIM,
+  MEDIA,
+  VHW,
+  HW,
+  FABRIC,
+  Q,
+  KOS,
+  MIND,
+  KERNEL,
+  OS,
+  WASM,
+  LIB,
+  GAMES,
+  LLM,
+  DOCS,
+  MODULES,
+  PACKAGE,
+  HOST,
+  run(code) {
+    const interp = new Interpreter();
+    try {
+      const result = interp.run(String(code));
+      return { ok: true, output: interp.out.slice(), result, error: null };
+    } catch (e) {
+      return { ok: false, output: interp.out.slice(), result: null, error: String(e.message || e) };
+    }
+  },
+  status() {
+    return {
+      version: this.version,
+      host: HOST.kind,
+      uptime_ms: HOST.now() - HOST.boot,
+      fs: FS.stats(),
+      pixels: PX.stats().count,
+      images: IMAGE.stats().count,
+      anims: ANIM.stats().count,
+      media: MEDIA.stats(),
+      vhw: VHW.stats(),
+      hw: HW.stats(),
+      fabric: FABRIC.stats(),
+      quantum_regs: Q.regs.size,
+      kos: KOS.stats(),
+      mind: MIND.status(),
+      kernel: KERNEL.status(),
+      os: OS.status(),
+      wasm: WASM.stats(),
+      games: GAMES.stats(),
+      llm: LLM.stats(),
+      lib: LIB.version,
+      modules: MODULES.stats(),
+      package: PACKAGE
+    };
+  },
+  selfTest() {
+    const tests = [
+      ['arith', 'print(2+3*4)', '14'],
+      ['fib', 'fn f(n)->n<2?n:f(n-1)+f(n-2)\nprint(f(8))', '21'],
+      ['match', 'match 2{1=>{print("a")}2=>{print("b")}_=>{print("c")}}', 'b'],
+      ['struct', 'struct P{x,y}\nlet p=P(1,2)\nprint(p.x)', '1'],
+      ['fs_mkdir', 'fs_mkdir("/tmp/x")\nprint(fs_isdir("/tmp/x"))', 'true'],
+      ['fs_write', 'fs_write("/tmp/f","hi")\nprint(fs_read("/tmp/f"))', 'hi'],
+      ['fs_scan', 'print(fs_stats().files > 0)', 'true'],
+      ['px_ingest', 'print(px_ingest("text","t","hello").meta.kind)', 'text'],
+      ['fs_pixel', 'fs_write("/t","v")\nprint(fs_to_pixel("/t").meta.kind)', 'file'],
+      ['img', 'img_create("i",64,64)\nprint(img_info("i").w)', '64'],
+      ['anim', 'anim_create("a",30,60)\nprint(anim_info("a").fps)', '30'],
+      ['video', 'video_create("v",320,240)\nprint(video_info("v").w)', '320'],
+      ['vhw', 'vhw_photon(10)\nprint(vhw_stat().vPhoton)', '10'],
+      ['game', 'game_register("g1","Demo")\nprint(game_stats().count)', '1'],
+      ['llm', 'llm_start("s1")\nprint(llm_stats().sessions)', '1'],
+      ['kernel', 'print(kern_call("echo","ok"))', 'ok'],
+      ['lib', 'print(lib_gcd(48,18))', '6'],
+      ['docs', 'print(starts_with(help("fs"),"Filesystem"))', 'true'],
+      ['module', 'module_export("m",#{v:1})\nimport_module("m")\nprint(m.v)', '1'],
+      ['package', 'print(package_info().license)', 'MIT'],
+      ['lib_sum', 'print(lib_sum([1,2,3,4]))', '10'],
+      ['format', 'print(format("a={} b={}",1,2))', 'a=1 b=2']
+    ];
+    let pass = 0, fail = 0;
+    const lines = [];
+    for (const [name, code, expect] of tests) {
+      const r = this.run(code);
+      const got = (r.output || []).join('\n').trim();
+      if (r.ok && got.includes(expect)) { pass++; lines.push('✓ ' + name); } else { fail++; lines.push('✗ ' + name + ' [' + got.slice(0, 40) + '] ' + (r.error || '')); }
+    }
+    lines.push('---');
+    lines.push('Apex: ' + pass + '/' + (pass + fail) + ' passed');
+    return { pass, fail, total: pass + fail, lines };
+  }
+};
+
+// ─── FIX: sortBy built‑in (boolean‑aware) ────────────────────
+(function addSortBy() {
+  if (typeof AETHER_CORE !== 'undefined' && AETHER_CORE.Interpreter) {
+    const origInstall = AETHER_CORE.Interpreter.prototype.installBuiltins;
+    AETHER_CORE.Interpreter.prototype.installBuiltins = function() {
+      origInstall.call(this);
+      this.globals.set('sortBy', (arr, fn) => {
+        if (!Array.isArray(arr)) return arr;
+        const copy = [...arr];
+        copy.sort((a, b) => {
+          const r = fn(a, b);
+          if (typeof r === 'boolean') {
+            return r ? -1 : 1;
+          }
+          return r;
+        });
+        return copy;
+      });
+    };
+  }
+})();
+
+// ─── Export for Node.js ──────────────────────────────────────
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = AETHER_CORE;
+}
