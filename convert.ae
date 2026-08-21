@@ -28,10 +28,14 @@ print "📦 Model: " + MODEL_ID
 print "📚 Repo:  " + HF_REPO
 print ""
 
-// ─── Fetch with retry ────────────────────────────────────────
-fn fetch_with_retry(url, maxRetries=3) {
+// ─── Fetch with retry (no default parameter) ────────────────
+fn fetch_with_retry(url, maxRetries) {
   mut attempt = 0
   mut lastError = ""
+  // Set default if maxRetries is nil or 0
+  if maxRetries == nil || maxRetries == 0 {
+    maxRetries = 3
+  }
   while attempt < maxRetries {
     attempt = attempt + 1
     print "  Fetch attempt " + str(attempt) + "/" + str(maxRetries) + "..."
@@ -54,7 +58,7 @@ fn fetch_with_retry(url, maxRetries=3) {
 let INDEX_URL = "https://huggingface.co/" + HF_REPO + "/resolve/main/model.safetensors.index.json"
 print "🔍 Fetching index: " + INDEX_URL
 
-let res = fetch_with_retry(INDEX_URL)
+let res = fetch_with_retry(INDEX_URL, 3)   // pass maxRetries explicitly
 if !res.ok {
   print "❌ Failed to fetch index: " + str(res.error)
   kern_call("node_exit", 1)
@@ -100,9 +104,9 @@ for tensor in tensorNames {
 print "✅ " + str(len(records)) + " records built"
 print ""
 
-// ─── Sort by hash ─────────────────────────────────────────────
+// ─── Sort by hash (use block return) ─────────────────────────
 print "📊 Sorting records by hash..."
-records = sortBy(records, fn(a, b) -> a.hash < b.hash)
+records = sortBy(records, fn(a, b) { return a.hash < b.hash })
 print "✅ Sorting complete"
 print ""
 
