@@ -1,23 +1,27 @@
-name: Pixel Builder (AETHER) – Auto on Push
+name: Pixel Builder (AETHER) – Auto & Manual
 
 on:
   push:
     paths:
       - 'models.txt'
-  workflow_dispatch:   # manual trigger still available
+      - 'convert.ae'
+      - 'aether-host.js'
+  workflow_dispatch:
     inputs:
       model:
         description: 'Model ID (e.g. kimi-k3)'
-        required: true
-        default: 'kimi-k3'
+        required: false
+        default: ''
       repo:
         description: 'HF repo (e.g. moonshotai/Kimi-K3)'
-        required: true
-        default: 'moonshotai/Kimi-K3'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one failure does not stop others
     steps:
       - uses: actions/checkout@v4
 
@@ -25,27 +29,72 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Read models.txt and convert each
-        id: models
+      - name: Convert models
+        id: convert
         run: |
-          if [ -f models.txt ]; then
-            cat models.txt | while read line; do
-              if [ -z "$line" ]; then continue; fi
-              MODEL=$(echo $line | cut -d' ' -f1)
-              REPO=$(echo $line | cut -d' ' -f2)
-              echo "Converting $MODEL from $REPO"
-              node aether-host.js convert.ae $MODEL $REPO
-              # We'll upload all shards at the end
-            done
+          # Ensure we have aether-core.js (create from embedded if missing)
+          if [ ! -f aether-core.js ]; then
+            echo "⚠️  aether-core.js not found – please ensure it exists."
+            exit 1
           fi
 
-      - name: Upload all generated shards to Release
+          # Function to convert a single model
+          convert_model() {
+            local model=$1
+            local repo=$2
+            echo "🔄 Converting $model from $repo"
+            node aether-host.js convert.ae "$model" "$repo"
+            local exitcode=$?
+            if [ $exitcode -eq 0 ]; then
+              echo "✅ Success: $model"
+            else
+              echo "❌ Failed: $model (exit $exitcode)"
+              return $exitcode
+            fi
+          }
+
+          # Manual trigger with specific model
+          if [ -n "${{ github.event.inputs.model }}" ]; then
+            MODEL="${{ github.event.inputs.model }}"
+            REPO="${{ github.event.inputs.repo }}"
+            if [ -z "$REPO" ]; then
+              REPO="$MODEL"
+            fi
+            convert_model "$MODEL" "$REPO"
+            exit $?
+          fi
+
+          # Read models.txt (one model per line: MODEL [REPO])
+          if [ -f models.txt ]; then
+            echo "📋 Reading models from models.txt"
+            while IFS=' ' read -r model repo || [ -n "$model" ]; do
+              # Skip empty lines and comments
+              [[ -z "$model" || "$model" == \#* ]] && continue
+              if [ -z "$repo" ]; then
+                repo="$model"
+              fi
+              convert_model "$model" "$repo" || true   # continue on failure
+            done < models.txt
+          else
+            echo "⚠️  No models.txt found and no manual input – nothing to do."
+            exit 0
+          fi
+
+      - name: Upload shards to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v1.0"
           files: |
-            shard_*.pix
-            shard_*.idx
-          fail_on_unmatched_files: false   # allow if no shards yet
+            shards/*.pix
+            shards/*.idx
+          fail_on_unmatched_files: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts for debugging (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shards
+          path: shards/
