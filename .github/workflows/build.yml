@@ -21,24 +21,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false   # one failure does not stop others
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
+      - name: Create shards directory
+        run: mkdir -p shards
+
       - name: Convert models
         id: convert
         run: |
-          # Ensure we have aether-core.js (create from embedded if missing)
-          if [ ! -f aether-core.js ]; then
-            echo "⚠️  aether-core.js not found – please ensure it exists."
-            exit 1
-          fi
-
-          # Function to convert a single model
           convert_model() {
             local model=$1
             local repo=$2
@@ -47,38 +42,41 @@ jobs:
             local exitcode=$?
             if [ $exitcode -eq 0 ]; then
               echo "✅ Success: $model"
+              # Move files to shards/ if they're in root
+              if [ -f "shard_${model}.pix" ]; then
+                mv "shard_${model}.pix" "shards/"
+              fi
+              if [ -f "shard_${model}.idx" ]; then
+                mv "shard_${model}.idx" "shards/"
+              fi
             else
               echo "❌ Failed: $model (exit $exitcode)"
               return $exitcode
             fi
           }
 
-          # Manual trigger with specific model
           if [ -n "${{ github.event.inputs.model }}" ]; then
             MODEL="${{ github.event.inputs.model }}"
             REPO="${{ github.event.inputs.repo }}"
-            if [ -z "$REPO" ]; then
-              REPO="$MODEL"
-            fi
+            [ -z "$REPO" ] && REPO="$MODEL"
             convert_model "$MODEL" "$REPO"
             exit $?
           fi
 
-          # Read models.txt (one model per line: MODEL [REPO])
           if [ -f models.txt ]; then
             echo "📋 Reading models from models.txt"
             while IFS=' ' read -r model repo || [ -n "$model" ]; do
-              # Skip empty lines and comments
               [[ -z "$model" || "$model" == \#* ]] && continue
-              if [ -z "$repo" ]; then
-                repo="$model"
-              fi
-              convert_model "$model" "$repo" || true   # continue on failure
+              [ -z "$repo" ] && repo="$model"
+              convert_model "$model" "$repo" || true
             done < models.txt
           else
-            echo "⚠️  No models.txt found and no manual input – nothing to do."
+            echo "⚠️  No models.txt found"
             exit 0
           fi
+
+          echo "📦 Generated shards:"
+          ls -la shards/ || echo "No shards found"
 
       - name: Upload shards to Release
         uses: softprops/action-gh-release@v2
